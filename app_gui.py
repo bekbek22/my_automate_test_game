@@ -125,6 +125,17 @@ class AutomationGUI(tk.Tk):
                             command=self._on_play_mode_change).pack(
                                 side="left", padx=8, pady=4)
 
+        lr_box = ttk.LabelFrame(self, text="Long Run Options")
+        lr_box.pack(fill="x", **pad)
+        self.lr_boost_var = tk.BooleanVar(
+            value=s.get("long_run_boost_enabled", M.long_run_boost_enabled))
+        self.lr_relay_var = tk.BooleanVar(
+            value=s.get("long_run_relay_enabled", M.long_run_relay_enabled))
+        ttk.Checkbutton(lr_box, text="Enable Boost Start", variable=self.lr_boost_var,
+                        command=self._on_long_run_toggle).pack(side="left", padx=8, pady=4)
+        ttk.Checkbutton(lr_box, text="Enable Relay", variable=self.lr_relay_var,
+                        command=self._on_long_run_toggle).pack(side="left", padx=8, pady=4)
+
         macro_box = ttk.LabelFrame(self, text="Macro Configuration")
         macro_box.pack(fill="x", **pad)
         ttk.Label(macro_box, text="Macro Name:").grid(row=0, column=0,
@@ -184,6 +195,17 @@ class AutomationGUI(tk.Tk):
             self.orch.playing_mode = mode
         self._append(f"[PLAY] playing mode -> {mode}\n")
 
+    def _on_long_run_toggle(self) -> None:
+        boost = self.lr_boost_var.get()
+        relay = self.lr_relay_var.get()
+        M.long_run_boost_enabled = boost
+        M.long_run_relay_enabled = relay
+        if self.orch:
+            self.orch.long_run_boost = boost
+            self.orch.long_run_relay = relay
+        self._save_config()
+        self._append(f"[LONG RUN] Boost Start={boost}  Relay={relay}\n")
+
     def _macro_path(self) -> str:
         name = self.name_var.get().strip() or "session"
         if name.lower().endswith(".json"):
@@ -211,6 +233,8 @@ class AutomationGUI(tk.Tk):
             "macro_name": self.name_var.get().strip() or "session",
             "cycles": cycles,
             "playing_mode": self.play_mode_var.get(),
+            "long_run_boost_enabled": self.lr_boost_var.get(),
+            "long_run_relay_enabled": self.lr_relay_var.get(),
         }
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
@@ -306,6 +330,8 @@ class AutomationGUI(tk.Tk):
         M.MACRO_SESSION_FILE = self._macro_path()
         M.MAX_CYCLES = cycles
         M.PLAYING_MODE = self.play_mode_var.get()
+        M.long_run_boost_enabled = self.lr_boost_var.get()
+        M.long_run_relay_enabled = self.lr_relay_var.get()
 
         self._save_config()
         self.orch = Orchestrator(M.MODE)

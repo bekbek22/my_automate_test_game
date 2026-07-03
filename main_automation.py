@@ -30,6 +30,9 @@ buy_boost_start = True
 buy_relay_character = False
 roll_random_buff = True
 
+long_run_boost_enabled = True
+long_run_relay_enabled = True
+
 
 
 MACRO_SESSION_FILE = "session.json"
@@ -131,6 +134,8 @@ class Orchestrator:
     def __init__(self, mode: str = MODE):
         self.mode = mode
         self.playing_mode = PLAYING_MODE
+        self.long_run_boost = long_run_boost_enabled
+        self.long_run_relay = long_run_relay_enabled
         self.adb_cfg = AdbConfig()
         self.adb = Adb(self.adb_cfg)
         self.running = True
@@ -590,17 +595,26 @@ class Orchestrator:
                          "RESULT banner confirmed (no captcha) -> GAME_OVER (-> OPEN_BOX)")
                 return State.GAME_OVER
             if self.playing_mode == "long_run":
+                if not (self.long_run_boost or self.long_run_relay):
+                    continue
                 reflex = self._region_color_ratio(BONUS_ICON_REGION,
                                                   REFLEX_TARGET_BLUE, REFLEX_TOLERANCE)
                 self.log(State.PLAYING,
                          f"support-slot density={reflex * 100:.2f}% "
-                         f"(need>={REFLEX_REQUIRED_RATIO * 100:.0f}%)")
+                         f"(need>={REFLEX_REQUIRED_RATIO * 100:.0f}%) "
+                         f"[boost={self.long_run_boost} relay={self.long_run_relay}]")
                 if reflex >= REFLEX_REQUIRED_RATIO:
-                    self.log(State.PLAYING, "Long Run Reflex: icon detected -> "
-                             "tap (816,428)+(860,620)")
-                    self.tap("boost_slot")
-                    self._sleep_responsive(0.05)
-                    self.tap("relay_slot")
+                    fired = []
+                    if self.long_run_boost:
+                        self.tap("boost_slot")
+                        fired.append("boost")
+                    if self.long_run_relay:
+                        if fired:
+                            self._sleep_responsive(0.05)
+                        self.tap("relay_slot")
+                        fired.append("relay")
+                    self.log(State.PLAYING,
+                             f"Long Run Reflex: icon detected -> tapped {fired}")
                     continue
         return State.GAME_OVER
 
