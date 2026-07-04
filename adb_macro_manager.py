@@ -232,6 +232,24 @@ class Adb:
             raise RuntimeError("screencap returned no data (device/connection?).")
         return Screenshot.from_raw(raw)
 
+    def screencap_png(self) -> bytes:
+        """Capture the framebuffer as PNG (`screencap -p`). Much smaller than the
+        raw RGBA buffer, so it occupies the shared device transport for far less
+        time -- used by the macro-mode watchdog to stop starving the macro's taps.
+        Persistent-socket fast path with a subprocess `exec-out` fallback."""
+        dev = self._device()
+        if dev is not None:
+            try:
+                conn = dev.create_connection()
+                with conn:
+                    conn.send("exec:/system/bin/screencap -p")
+                    raw = conn.read_all()
+                if raw:
+                    return raw
+            except Exception:
+                self._drop_device()
+        return self.exec_out("screencap", "-p")
+
     def find_touch_device(self) -> tuple[str, int, int]:
         out = self.shell("getevent", "-pl")
         cur_dev: Optional[str] = None

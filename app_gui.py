@@ -47,12 +47,28 @@ class GuiLogHandler(logging.Handler):
 class AutomationGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Automation Control Panel")
-        self.geometry("660x720")
-        self.minsize(580, 600)
+        self.title("CookieRun Automation — Control Panel")
+        # Tall enough to show the whole sidebar un-maximized (restore-down size),
+        # and start MAXIMIZED on Windows so nothing clips out of the box.
+        self.geometry("880x850")
+        self.minsize(760, 600)
+        try:
+            self.state("zoomed")            # Windows/most X11 window managers
+        except tk.TclError:
+            try:
+                self.attributes("-zoomed", True)   # some Linux WMs
+            except tk.TclError:
+                pass
 
         self.log_queue: "queue.Queue[str]" = queue.Queue()
         self._orig_stdout = sys.stdout
+
+        # Thread-safe run counter: the orchestrator (background thread) only
+        # increments the int under a lock; the main-thread poll loop is the ONLY
+        # code that touches the Tk widget -> no cross-thread widget access.
+        self._run_count = 0
+        self._run_count_lock = threading.Lock()
+        self._run_count_shown = -1
 
         self._log_handler = GuiLogHandler(self.log_queue)
         self._log_handler.setFormatter(
@@ -76,6 +92,7 @@ class AutomationGUI(tk.Tk):
 
         self._saved = self._load_config()
 
+        self._setup_style()
         self._build_widgets()
         if self._saved:
             self.log_queue.put("[INIT] Previous configuration restored successfully.\n")
@@ -84,108 +101,179 @@ class AutomationGUI(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
 
+    _BG = "#f4f6f8"
+    _SIDEBAR_W = 224
+
+    def _setup_style(self) -> None:
+        """Compact, developer-dashboard ttk theme: 9pt UI font, tight padding,
+        accent/danger action buttons."""
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        base = ("Segoe UI", 9)
+        self.configure(bg=self._BG)
+        style.configure(".", font=base, background=self._BG, foreground="#2c3e50")
+        style.configure("TFrame", background=self._BG)
+        style.configure("TLabel", background=self._BG, foreground="#2c3e50")
+        style.configure("TCheckbutton", background=self._BG, font=base, padding=0)
+        style.configure("TRadiobutton", background=self._BG, font=base, padding=0)
+        style.configure("TLabelframe", background=self._BG, relief="solid",
+                        borderwidth=1, padding=4)
+        style.configure("TLabelframe.Label", background=self._BG,
+                        font=("Segoe UI", 9, "bold"), foreground="#33475b")
+        style.configure("TButton", font=base, padding=(4, 2))
+        style.configure("TEntry", padding=1)
+        style.configure("Header.TLabel", font=("Segoe UI", 11, "bold"),
+                        foreground="#1b2a3a")
+        style.configure("Sub.TLabel", font=("Segoe UI", 8), foreground="#7a8899")
+        style.configure("Stat.TLabel", font=("Segoe UI", 13, "bold"),
+                        foreground="#2e9e44")
+        style.configure("Accent.TButton", font=("Segoe UI", 9, "bold"), padding=(4, 3))
+        style.map("Accent.TButton",
+                  background=[("disabled", "#b8c4cc"), ("!disabled", "#2e9e44")],
+                  foreground=[("!disabled", "#ffffff")])
+        style.configure("Danger.TButton", font=("Segoe UI", 9, "bold"), padding=(4, 3))
+        style.map("Danger.TButton",
+                  background=[("disabled", "#b8c4cc"), ("!disabled", "#d9333f")],
+                  foreground=[("!disabled", "#ffffff")])
+
     def _build_widgets(self) -> None:
-        pad = {"padx": 8, "pady": 4}
-
-        status_bar = ttk.Frame(self)
-        status_bar.pack(fill="x", **pad)
-        self.status_label = tk.Label(status_bar, text="🔴 Device Disconnected",
-                                     fg="#d9333f", font=("Segoe UI", 10, "bold"))
-        self.status_label.pack(side="left", padx=4)
-        self.reconnect_btn = ttk.Button(status_bar, text="🔌 Reconnect",
-                                        command=self._on_reconnect, width=14)
-        self.reconnect_btn.pack(side="right", padx=4)
-
         s = self._saved
-        mode_box = ttk.LabelFrame(self, text="Mode")
-        mode_box.pack(fill="x", **pad)
+        root = ttk.Frame(self, padding=6)
+        root.pack(fill="both", expand=True)
+
+        # Slim control sidebar (fixed width) | dominant log stream (expands).
+        sidebar = ttk.Frame(root, width=self._SIDEBAR_W)
+        sidebar.pack(side="left", fill="y")
+        sidebar.pack_propagate(False)
+        logpane = ttk.Frame(root)
+        logpane.pack(side="left", fill="both", expand=True, padx=(6, 0))
+
+        gp = {"fill": "x", "pady": (0, 4)}          # compact group spacing
+
+        ttk.Label(sidebar, text="CookieRun Automation",
+                  style="Header.TLabel").pack(anchor="w", pady=(0, 4))
+
+        # --- Connection ---
+        conn = ttk.LabelFrame(sidebar, text="Connection")
+        conn.pack(**gp)
+        self.status_label = tk.Label(conn, text="🔴 Disconnected", fg="#d9333f",
+                                     bg=self._BG, font=("Segoe UI", 9, "bold"))
+        self.status_label.pack(anchor="w")
+        ttk.Label(conn, text=self.adb_cfg.serial, style="Sub.TLabel").pack(anchor="w")
+        self.reconnect_btn = ttk.Button(conn, text="🔌 Reconnect",
+                                        command=self._on_reconnect)
+        self.reconnect_btn.pack(fill="x", pady=(3, 0))
+
+        # --- Session Statistics ---
+        stats = ttk.LabelFrame(sidebar, text="Session Statistics")
+        stats.pack(**gp)
+        self.runs_var = tk.StringVar(value="Completed Runs: 0")
+        ttk.Label(stats, textvariable=self.runs_var, style="Stat.TLabel").pack(anchor="w")
+        self.reset_runs_btn = ttk.Button(stats, text="Reset Counter",
+                                         command=self._reset_run_count)
+        self.reset_runs_btn.pack(fill="x", pady=(3, 0))
+
+        # --- Primary actions (pinned high so they never clip) ---
+        self.start_btn = ttk.Button(sidebar, text="▶  Start Automation",
+                                    style="Accent.TButton", command=self._on_start)
+        self.start_btn.pack(fill="x", pady=(0, 2))
+        self.stop_btn = ttk.Button(sidebar, text="■  Stop / Emergency Break",
+                                   style="Danger.TButton", command=self._on_stop,
+                                   state="disabled")
+        self.stop_btn.pack(fill="x", pady=(0, 4))
+
+        # --- Mode ---
+        mode_box = ttk.LabelFrame(sidebar, text="Mode")
+        mode_box.pack(**gp)
         self.mode_var = tk.StringVar(value=s.get("mode", M.MODE))
         for label in ("FULL_AUTO", "CAPTCHA_ONLY"):
             ttk.Radiobutton(mode_box, text=label, value=label,
-                            variable=self.mode_var).pack(side="left", padx=8, pady=4)
+                            variable=self.mode_var).pack(anchor="w")
 
-        chk_box = ttk.LabelFrame(self, text="Pre-Match Checklist")
-        chk_box.pack(fill="x", **pad)
-        self.boost_var = tk.BooleanVar(value=s.get("buy_boost_start", M.buy_boost_start))
-        self.relay_var = tk.BooleanVar(value=s.get("buy_relay_character", M.buy_relay_character))
-        self.roll_var = tk.BooleanVar(value=s.get("roll_random_buff", M.roll_random_buff))
-        ttk.Checkbutton(chk_box, text="buy_boost_start",
-                        variable=self.boost_var).pack(anchor="w", padx=8)
-        ttk.Checkbutton(chk_box, text="buy_relay_character",
-                        variable=self.relay_var).pack(anchor="w", padx=8)
-        ttk.Checkbutton(chk_box, text="roll_random_buff",
-                        variable=self.roll_var).pack(anchor="w", padx=8)
-
-        play_box = ttk.LabelFrame(self, text="Playing Mode")
-        play_box.pack(fill="x", **pad)
+        # --- Playing Mode ---
+        play_box = ttk.LabelFrame(sidebar, text="Playing Mode")
+        play_box.pack(**gp)
         self.play_mode_var = tk.StringVar(value=s.get("playing_mode", M.PLAYING_MODE))
         for text, val in (("Macro Play", "macro"), ("Long Run", "long_run")):
-            ttk.Radiobutton(play_box, text=text, value=val,
-                            variable=self.play_mode_var,
-                            command=self._on_play_mode_change).pack(
-                                side="left", padx=8, pady=4)
+            ttk.Radiobutton(play_box, text=text, value=val, variable=self.play_mode_var,
+                            command=self._on_play_mode_change).pack(anchor="w")
 
-        lr_box = ttk.LabelFrame(self, text="Long Run Options")
-        lr_box.pack(fill="x", **pad)
+        # --- Long Run Options ---
+        lr_box = ttk.LabelFrame(sidebar, text="Long Run Options")
+        lr_box.pack(**gp)
         self.lr_boost_var = tk.BooleanVar(
             value=s.get("long_run_boost_enabled", M.long_run_boost_enabled))
         self.lr_relay_var = tk.BooleanVar(
             value=s.get("long_run_relay_enabled", M.long_run_relay_enabled))
         ttk.Checkbutton(lr_box, text="Enable Boost Start", variable=self.lr_boost_var,
-                        command=self._on_long_run_toggle).pack(side="left", padx=8, pady=4)
+                        command=self._on_long_run_toggle).pack(anchor="w")
         ttk.Checkbutton(lr_box, text="Enable Relay", variable=self.lr_relay_var,
-                        command=self._on_long_run_toggle).pack(side="left", padx=8, pady=4)
+                        command=self._on_long_run_toggle).pack(anchor="w")
 
-        macro_box = ttk.LabelFrame(self, text="Macro Configuration")
-        macro_box.pack(fill="x", **pad)
-        ttk.Label(macro_box, text="Macro Name:").grid(row=0, column=0,
-                                                      sticky="w", padx=8, pady=4)
+        # --- Pre-Match Checklist ---
+        chk_box = ttk.LabelFrame(sidebar, text="Pre-Match Checklist")
+        chk_box.pack(**gp)
+        self.boost_var = tk.BooleanVar(value=s.get("buy_boost_start", M.buy_boost_start))
+        self.relay_var = tk.BooleanVar(value=s.get("buy_relay_character", M.buy_relay_character))
+        self.roll_var = tk.BooleanVar(value=s.get("roll_random_buff", M.roll_random_buff))
+        ttk.Checkbutton(chk_box, text="Buy Boost Start",
+                        variable=self.boost_var).pack(anchor="w")
+        ttk.Checkbutton(chk_box, text="Buy Relay Character",
+                        variable=self.relay_var).pack(anchor="w")
+        ttk.Checkbutton(chk_box, text="Roll Random Buff",
+                        variable=self.roll_var).pack(anchor="w")
+
+        # --- Macro Configuration ---
+        macro_box = ttk.LabelFrame(sidebar, text="Macro Configuration")
+        macro_box.pack(**gp)
+        macro_box.columnconfigure(1, weight=1)
+        ttk.Label(macro_box, text="Name").grid(row=0, column=0, sticky="w")
         self.name_var = tk.StringVar(value=s.get("macro_name", "session"))
-        ttk.Entry(macro_box, textvariable=self.name_var, width=24).grid(
-            row=0, column=1, sticky="w", padx=4, pady=4)
-        ttk.Label(macro_box, text="(.json added automatically)").grid(
-            row=0, column=2, sticky="w", padx=4)
-        ttk.Label(macro_box, text="Cycles (-1 = infinite):").grid(
-            row=1, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(macro_box, textvariable=self.name_var).grid(
+            row=0, column=1, sticky="ew", padx=(4, 0), pady=1)
+        ttk.Label(macro_box, text="Cycles").grid(row=1, column=0, sticky="w")
         self.loops_var = tk.StringVar(value=str(s.get("cycles", -1)))
-        ttk.Entry(macro_box, textvariable=self.loops_var, width=8).grid(
-            row=1, column=1, sticky="w", padx=4, pady=4)
+        ttk.Entry(macro_box, textvariable=self.loops_var).grid(
+            row=1, column=1, sticky="ew", padx=(4, 0), pady=1)
+        # Mirror of the Long Run "Enable Relay" toggle, bound to the SAME var so
+        # both checkboxes stay in sync -- the macro-mode watchdog reads this flag
+        # too (revive-on-death gating), so it's surfaced here for convenience.
+        ttk.Checkbutton(macro_box, text="Enable Relay (revive on death)",
+                        variable=self.lr_relay_var,
+                        command=self._on_long_run_toggle).grid(
+                            row=2, column=0, columnspan=2, sticky="w", pady=(3, 0))
 
-        tools_box = ttk.LabelFrame(self, text="Macro Recorder & Tools")
-        tools_box.pack(fill="x", **pad)
+        # --- Recorder & Tools ---
+        tools_box = ttk.LabelFrame(sidebar, text="Recorder & Tools")
+        tools_box.pack(**gp)
         self.record_btn = ttk.Button(tools_box, text="⏺ Record New Macro",
                                      command=self._on_record)
-        self.record_btn.pack(side="left", padx=6, pady=6, ipadx=4, ipady=2)
+        self.record_btn.pack(fill="x", pady=1)
         self.stop_rec_btn = ttk.Button(tools_box, text="⏹ Stop Recording",
-                                       command=self._on_stop_record,
-                                       state="disabled")
-        self.stop_rec_btn.pack(side="left", padx=6, pady=6, ipadx=4, ipady=2)
+                                       command=self._on_stop_record, state="disabled")
+        self.stop_rec_btn.pack(fill="x", pady=1)
         self.test_btn = ttk.Button(tools_box, text="▶ Test Play Macro",
                                    command=self._on_test)
-        self.test_btn.pack(side="left", padx=6, pady=6, ipadx=4, ipady=2)
+        self.test_btn.pack(fill="x", pady=1)
 
-        btn_box = ttk.Frame(self)
-        btn_box.pack(fill="x", **pad)
-        self.start_btn = ttk.Button(btn_box, text="▶ Start Automation",
-                                    command=self._on_start)
-        self.start_btn.pack(side="left", padx=8, ipadx=10, ipady=4)
-        self.stop_btn = ttk.Button(btn_box, text="■ Stop / Emergency Break",
-                                   command=self._on_stop, state="disabled")
-        self.stop_btn.pack(side="left", padx=8, ipadx=10, ipady=4)
-
-        log_box = ttk.LabelFrame(self, text="Automation Live Logs")
-        log_box.pack(fill="both", expand=True, **pad)
-        log_toolbar = ttk.Frame(log_box)
-        log_toolbar.pack(fill="x", padx=4, pady=(4, 0))
-        ttk.Label(log_toolbar,
-                  text="watchdog · captcha · macro · clicks  (real-time)",
-                  foreground="#7a8899").pack(side="left")
-        ttk.Button(log_toolbar, text="Clear", width=8,
+        # --- Dominant log stream ---
+        log_head = ttk.Frame(logpane)
+        log_head.pack(fill="x", pady=(0, 3))
+        ttk.Label(log_head, text="Automation Live Logs",
+                  style="Header.TLabel").pack(side="left")
+        ttk.Button(log_head, text="Clear", width=7,
                    command=self._on_clear_log).pack(side="right")
-        self.log = scrolledtext.ScrolledText(log_box, height=16, state="disabled",
+        ttk.Label(log_head, text="watchdog · captcha · macro · clicks",
+                  style="Sub.TLabel").pack(side="right", padx=8)
+        self.log = scrolledtext.ScrolledText(logpane, state="disabled",
                                              bg="#101418", fg="#d6deeb",
-                                             font=("Consolas", 9))
-        self.log.pack(fill="both", expand=True, padx=4, pady=4)
+                                             insertbackground="#d6deeb",
+                                             font=("Consolas", 9),
+                                             relief="flat", borderwidth=0)
+        self.log.pack(fill="both", expand=True)
 
 
     def _on_play_mode_change(self) -> None:
@@ -201,8 +289,8 @@ class AutomationGUI(tk.Tk):
         M.long_run_boost_enabled = boost
         M.long_run_relay_enabled = relay
         if self.orch:
-            self.orch.long_run_boost = boost
-            self.orch.long_run_relay = relay
+            self.orch.long_run_boost_enabled = boost
+            self.orch.long_run_relay_enabled = relay
         self._save_config()
         self._append(f"[LONG RUN] Boost Start={boost}  Relay={relay}\n")
 
@@ -335,6 +423,7 @@ class AutomationGUI(tk.Tk):
 
         self._save_config()
         self.orch = Orchestrator(M.MODE)
+        self.orch.on_run_complete = self._bump_run_count
         self._launch("orch", self.orch.run)
 
 
@@ -395,6 +484,15 @@ class AutomationGUI(tk.Tk):
         self.stop_rec_btn.config(state="normal" if tag == "record" else "disabled")
         self.stop_btn.config(state="normal" if running else "disabled")
 
+        # Run counter: read the shared int (written by the orchestrator thread)
+        # under the lock and refresh the label only when it changed. This is the
+        # ONLY place the counter widget is touched -> stays on the main thread.
+        with self._run_count_lock:
+            count = self._run_count
+        if count != self._run_count_shown:
+            self._run_count_shown = count
+            self.runs_var.set(f"Completed Runs: {count}")
+
         if self._connected:
             self.status_label.config(text=f"🟢 Connected: {self._device_id}",
                                      fg="#2e9e44")
@@ -413,6 +511,19 @@ class AutomationGUI(tk.Tk):
         self.log.config(state="normal")
         self.log.delete("1.0", "end")
         self.log.config(state="disabled")
+
+    def _bump_run_count(self) -> None:
+        """Called from the orchestrator's background thread on each completed run.
+        Only mutates the guarded int -- the label is refreshed by _poll_log on the
+        main thread, so no Tk widget is ever touched off-thread."""
+        with self._run_count_lock:
+            self._run_count += 1
+
+    def _reset_run_count(self) -> None:
+        """Zero the session run counter (the label updates on the next poll)."""
+        with self._run_count_lock:
+            self._run_count = 0
+        self._append("[STATS] Run counter reset to 0.\n")
 
     def _on_close(self) -> None:
         self._save_config()

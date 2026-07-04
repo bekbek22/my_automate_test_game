@@ -72,12 +72,20 @@ CAPTCHA_OCR_REGION = (492, 43, 722, 71)
 CAPTCHA_CACHE_TTL_S = 0.5
 CAPTCHA_CACHE_STRIDE = 8
 
+# Long Run auto boost/relay: pure pixel-colour reflex. When the support icon is
+# present in BONUS_ICON_REGION (REFLEX_TARGET_BLUE density), tap the boost/relay
+# slots -- each strictly gated by its GUI toggle (long_run_boost_enabled /
+# long_run_relay_enabled). No image/template matching here.
 BONUS_ICON_REGION = (725, 334, 183, 188)
 REFLEX_TARGET_BLUE = (32, 74, 124)
 REFLEX_TOLERANCE = 50
 REFLEX_REQUIRED_RATIO = 0.05
 BOOST_SLOT_CLICK = (816, 428)
 RELAY_SLOT_CLICK = (860, 620)
+# Macro-watchdog boost/relay reflex (pure pixel-colour, per-toggle gated).
+RELAY_ARM_DELAY_S = 30.0            # relay only armed after the boost/setup phase
+RELAY_REVIVE_COOLDOWN_S = 4.0       # min gap between relay revive taps
+BOOST_TAP_COOLDOWN_S = 4.0          # min gap between boost taps (anti 5Hz spam)
 
 GAMEPLAY_MOTION_REGION = (300, 500, 300, 300)
 GAMEPLAY_ACTIVE_MAE = 15.0
@@ -92,6 +100,18 @@ CONGRATS_COLOR_TOLERANCE = 25
 CONGRATS_REQUIRED_RATIO = 0.15
 CONGRATS_CONFIRM = (799, 707)
 
+# Main-menu ticket gate (OpenCV template anchor + OCR). The ticket badge region
+# doubles as (a) a MAIN_MENU state anchor (template match of the red diamond/chain
+# icon) and (b) the ticket-cap readout ("x/3"). Place the reference crop at
+# assets/tickets_base.png. Degrades gracefully (proceeds) if cv2/Tesseract/the
+# asset are missing, so the bot never dead-loops.
+MAIN_MENU_TICKET_REGION = (571, 97, 156, 81)   # (x, y, w, h)
+TICKET_TEMPLATE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "assets", "tickets_base.png")
+TICKET_MATCH_THRESHOLD = 0.75                   # cv2 matchTemplate confidence
+TICKET_FULL = "3/3"                             # start only when tickets are full
+TICKET_RECHECK_S = 5.0                          # standby poll gap (anti dead-loop)
+
 COORDS: Dict[str, tuple[int, int]] = {
     "play_button":      (1191, 806),
     "boost_item":       (282, 745),
@@ -102,6 +122,7 @@ COORDS: Dict[str, tuple[int, int]] = {
     "buff_confirm":     (793, 735),
     "game_start":       (1118, 765),
     "boost_slot":       BOOST_SLOT_CLICK,
+    "boost_start":      BOOST_SLOT_CLICK,   # relay revive tap (same slot as boost)
     "relay_slot":       RELAY_SLOT_CLICK,
     "game_over_ok":     (579, 770),
     "open_all_button":  (805, 795),
@@ -134,11 +155,19 @@ class Orchestrator:
     def __init__(self, mode: str = MODE):
         self.mode = mode
         self.playing_mode = PLAYING_MODE
-        self.long_run_boost = long_run_boost_enabled
-        self.long_run_relay = long_run_relay_enabled
+        self.long_run_boost_enabled = long_run_boost_enabled
+        self.long_run_relay_enabled = long_run_relay_enabled
         self.adb_cfg = AdbConfig()
         self.adb = Adb(self.adb_cfg)
         self.running = True
+
+        self.completed_runs = 0
+        self.on_run_complete = None
+
+        # Sequence counter for the macro watchdog's BONUS_ICON events.
+        # 0 -> the next icon is the INITIAL BOOST; >=1 -> subsequent MID-GAME RELAY.
+        # Reset at the start of every macro run in _run_macro_subprocess().
+        self._boost_slot_click_count = 0
 
         self._init_debug_log()
 
@@ -196,8 +225,96 @@ class Orchestrator:
         self._sleep_responsive(1.0)
 
 
+    def _ticket_template(self):
+        """Cached grayscale template for the MAIN_MENU ticket anchor, or None if
+        cv2/the asset is unavailable (-> anchor degrades to 'n/a')."""
+        if getattr(self, "_ticket_tmpl_cache", "unset") == "unset":
+            self._ticket_tmpl_cache = None
+            try:
+                import cv2
+                if os.path.exists(TICKET_TEMPLATE_PATH):
+                    self._ticket_tmpl_cache = cv2.imread(TICKET_TEMPLATE_PATH,
+                                                         cv2.IMREAD_GRAYSCALE)
+                else:
+                    self.log(State.MAIN_MENU,
+                             f"ticket template missing: {TICKET_TEMPLATE_PATH}")
+            except Exception as exc:
+                self.log(State.MAIN_MENU, f"ticket template load error: {exc}")
+        return self._ticket_tmpl_cache
+
+    def _match_main_menu_anchor(self, shot) -> float:
+        """OpenCV template match of the ticket icon within MAIN_MENU_TICKET_REGION.
+        Returns the best match confidence (0..1), or -1.0 if it can't run
+        (missing cv2/template) so callers treat it as 'unknown', not 'no match'."""
+        try:
+            import cv2
+            tmpl = self._ticket_template()
+            if tmpl is None:
+                return -1.0
+            x, y, w, h = MAIN_MENU_TICKET_REGION
+            roi = self._shot_to_bgr(shot)[y:y + h, x:x + w]
+            roi_g = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            if tmpl.shape[0] > roi_g.shape[0] or tmpl.shape[1] > roi_g.shape[1]:
+                return -1.0                          # template bigger than ROI
+            res = cv2.matchTemplate(roi_g, tmpl, cv2.TM_CCOEFF_NORMED)
+            return float(res.max())
+        except Exception as exc:
+            self.log(State.MAIN_MENU, f"anchor match error: {exc}")
+            return -1.0
+
+    def _ocr_ticket_text(self, shot) -> "Optional[str]":
+        """OCR the ticket cap ("x/3") from MAIN_MENU_TICKET_REGION. Upscales +
+        grayscales + Otsu-thresholds the crop, whitelists digits/slash, and
+        regex-extracts the pattern. Returns e.g. '3/3', or None if unreadable /
+        the OCR stack is unavailable (-> caller proceeds, no dead-loop)."""
+        try:
+            import re
+            import cv2
+            import find_the_card as ftc              # configures pytesseract path
+            pyt = getattr(ftc, "pytesseract", None)
+            if pyt is None:
+                return None
+            x, y, w, h = MAIN_MENU_TICKET_REGION
+            roi = self._shot_to_bgr(shot)[y:y + h, x:x + w]
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            gray = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+            gray = cv2.threshold(gray, 0, 255,
+                                 cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+            txt = pyt.image_to_string(
+                gray, config="--psm 7 -c tessedit_char_whitelist=0123456789/")
+            match = re.search(r"([0-3])\s*/\s*3", txt)
+            return f"{match.group(1)}/3" if match else None
+        except Exception as exc:
+            self.log(State.MAIN_MENU, f"ticket OCR error: {exc}")
+            return None
+
     def handle_main_menu(self) -> State:
         self._throttle()
+        # TICKET GATE: only start a match when tickets are full ("3/3"). The
+        # template match doubles as a MAIN_MENU state anchor (logged). Degrades
+        # to 'proceed' when the ticket text can't be read so it never dead-loops.
+        while self.running:
+            shot = self._grab_watchdog_frame()
+            conf = self._match_main_menu_anchor(shot)
+            anchor = ("confirmed" if conf >= TICKET_MATCH_THRESHOLD
+                      else "n/a" if conf < 0 else f"low({conf:.2f})")
+            text = self._ocr_ticket_text(shot)
+
+            if text is None:
+                self.log(State.MAIN_MENU,
+                         f"MAIN_MENU anchor={anchor}; ticket unreadable -> proceeding")
+                break
+            if text == TICKET_FULL:
+                self.log(State.MAIN_MENU,
+                         f"MAIN_MENU anchor={anchor}; tickets FULL ({text}) -> start")
+                break
+            self.log(State.MAIN_MENU,
+                     f"[orchestrator] Tickets are not full yet ({text}). Standing by...")
+            self._sleep_responsive(TICKET_RECHECK_S)
+
+        if not self.running:
+            return State.MAIN_MENU
+
         self.log(State.MAIN_MENU, "clicking play button -> prep")
         self.tap("play_button")
         self.sleep_human(1.5)
@@ -326,6 +443,7 @@ class Orchestrator:
         threading.Thread(target=_pump_macro_output, daemon=True).start()
 
         self._watchdog_detected = None
+        self._boost_slot_click_count = 0   # new run: next icon is the initial Boost
         stop_evt = threading.Event()
         wd = threading.Thread(target=self._background_watchdog_loop,
                               args=(proc, stop_evt), daemon=True)
@@ -355,19 +473,96 @@ class Orchestrator:
             return self._post_solver_state()
         return detected
 
+    def _png_to_screenshot(self, png: bytes) -> "Screenshot":
+        """Decode a PNG framebuffer into a raw-RGBA Screenshot so every existing
+        detection helper (_frame_view / _region_color_ratio / _captcha_* ) keeps
+        working unchanged on the PNG path."""
+        import struct
+        import cv2
+        import numpy as np
+        bgr = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise RuntimeError("PNG decode failed")
+        h, w = bgr.shape[:2]
+        rgba = np.empty((h, w, 4), np.uint8)
+        rgba[:, :, 0] = bgr[:, :, 2]        # R
+        rgba[:, :, 1] = bgr[:, :, 1]        # G
+        rgba[:, :, 2] = bgr[:, :, 0]        # B
+        rgba[:, :, 3] = 255
+        return Screenshot.from_raw(struct.pack("<II", w, h) + rgba.tobytes())
+
+    def _grab_watchdog_frame(self) -> "Screenshot":
+        """Watchdog frame source: PNG capture (small payload -> frees the shared
+        transport for the macro's taps), decoded to a Screenshot. Falls back to
+        the raw capture on any error (also the path the mock self-check takes)."""
+        try:
+            png = self.adb.screencap_png()
+            if png:
+                return self._png_to_screenshot(png)
+        except Exception:
+            pass
+        return self.adb.screenshot()
+
     def _background_watchdog_loop(self, proc, stop_evt: "threading.Event") -> None:
+        """Macro-mode screen watchdog (5 Hz, PNG frames). PURE PIXEL-COLOUR -- no
+        template matching. Priority + SEQUENCE-COUNTER gating:
+          1. Captcha (OCR, cached) -> CAPTCHA (terminate).
+          2. BONUS_ICON colour event (edge-triggered: only the absent->present
+             transition counts, so one on-screen icon = one event regardless of
+             the 5 Hz sampling rate). Each event is classified by the sequence
+             counter self._boost_slot_click_count:
+               * count == 0  -> INITIAL BOOST. Tap "boost_slot" ONLY if
+                                long_run_boost_enabled. Counter advances either way
+                                so the NEXT event is treated as a relay.
+               * count >= 1  -> MID-GAME RELAY. Tap "boost_start" ONLY if
+                                long_run_relay_enabled. If disabled the tap is
+                                completely short-circuited (never a premature
+                                GAME_OVER; false icon detections are ignored).
+          3. RESULT banner (color, captcha-confirm gated) -> GAME_OVER (terminate).
+             This static backstop is the ONLY thing that ends the run.
+        """
+        icon_present_prev = False
         while (not stop_evt.is_set() and proc.poll() is None and self.running):
+            detected = None
             try:
-                shot = self.adb.screenshot()
-                if self._captcha_active_cached(shot):
+                shot = self._grab_watchdog_frame()      # PNG (raw fallback)
+                if self._captcha_active_cached(shot):   # captcha has priority
                     detected = State.CAPTCHA
-                elif self._region_color_ratio(
-                        RESULT_COLOR_REGION, RESULT_TARGET_RGB,
-                        RESULT_COLOR_TOLERANCE, shot=shot) >= RESULT_REQUIRED_RATIO:
-                    detected = (State.CAPTCHA if self._captcha_confirm()
-                                else State.GAME_OVER)
                 else:
-                    detected = None
+                    # ---- Single BONUS_ICON colour read, edge-triggered so one
+                    # visible icon fires exactly once (no 5 Hz double-counting). --
+                    icon_present = (self._region_color_ratio(
+                        BONUS_ICON_REGION, REFLEX_TARGET_BLUE,
+                        REFLEX_TOLERANCE, shot=shot) >= REFLEX_REQUIRED_RATIO)
+
+                    if icon_present and not icon_present_prev:   # rising edge = event
+                        if self._boost_slot_click_count == 0:
+                            # ---- INITIAL BOOST -----------------------------------
+                            if self.long_run_boost_enabled:
+                                self.tap("boost_slot")
+                                self.log(State.PLAYING,
+                                         "watchdog: initial Boost tap (boost_slot)")
+                            # Advance regardless so the next icon becomes a relay,
+                            # even when Boost is toggled off.
+                            self._boost_slot_click_count += 1
+                        else:
+                            # ---- MID-GAME RELAY ----------------------------------
+                            if self.long_run_relay_enabled:
+                                self.tap("boost_start")   # revive; macro continues
+                                self.log(State.PLAYING,
+                                         "watchdog: Relay revive tap #"
+                                         f"{self._boost_slot_click_count} (boost_start)")
+                                self._boost_slot_click_count += 1
+                            # Relay disabled -> tap fully short-circuited, counter
+                            # held so the next real event is still a relay.
+                    icon_present_prev = icon_present
+
+                    # ---- RESULT backstop -- the SOLE run-ender (toggle-independent).
+                    if self._region_color_ratio(
+                            RESULT_COLOR_REGION, RESULT_TARGET_RGB,
+                            RESULT_COLOR_TOLERANCE, shot=shot) >= RESULT_REQUIRED_RATIO:
+                        detected = (State.CAPTCHA if self._captcha_confirm()
+                                    else State.GAME_OVER)
             except Exception as exc:
                 self.log(State.PLAYING, f"watchdog sample error: {exc}")
                 detected = None
@@ -595,26 +790,31 @@ class Orchestrator:
                          "RESULT banner confirmed (no captcha) -> GAME_OVER (-> OPEN_BOX)")
                 return State.GAME_OVER
             if self.playing_mode == "long_run":
-                if not (self.long_run_boost or self.long_run_relay):
+                # Pure pixel-colour reflex, STRICTLY gated per GUI toggle. If both
+                # toggles are OFF, skip the detection entirely (fully ignored, no
+                # competing trigger). Otherwise read the support-icon density once
+                # and tap ONLY the slot(s) whose toggle is ON.
+                if not (self.long_run_boost_enabled or self.long_run_relay_enabled):
                     continue
-                reflex = self._region_color_ratio(BONUS_ICON_REGION,
-                                                  REFLEX_TARGET_BLUE, REFLEX_TOLERANCE)
+                icon_present = self._region_color_ratio(
+                    BONUS_ICON_REGION, REFLEX_TARGET_BLUE,
+                    REFLEX_TOLERANCE) >= REFLEX_REQUIRED_RATIO
                 self.log(State.PLAYING,
-                         f"support-slot density={reflex * 100:.2f}% "
-                         f"(need>={REFLEX_REQUIRED_RATIO * 100:.0f}%) "
-                         f"[boost={self.long_run_boost} relay={self.long_run_relay}]")
-                if reflex >= REFLEX_REQUIRED_RATIO:
+                         f"long-run reflex: icon={icon_present} "
+                         f"[boost={self.long_run_boost_enabled} "
+                         f"relay={self.long_run_relay_enabled}]")
+                if icon_present:
                     fired = []
-                    if self.long_run_boost:
+                    if self.long_run_boost_enabled:      # short-circuited if OFF
                         self.tap("boost_slot")
                         fired.append("boost")
-                    if self.long_run_relay:
+                    if self.long_run_relay_enabled:      # short-circuited if OFF
                         if fired:
                             self._sleep_responsive(0.05)
                         self.tap("relay_slot")
                         fired.append("relay")
                     self.log(State.PLAYING,
-                             f"Long Run Reflex: icon detected -> tapped {fired}")
+                             f"long-run reflex: tapped {fired}")
                     continue
         return State.GAME_OVER
 
@@ -845,6 +1045,18 @@ class Orchestrator:
                     self.log(state, f"--- cycle {cycles}/{total} ---")
                 handler = self.handlers[state]
                 state = handler()
+
+                if state == State.GAME_OVER:
+                    self.completed_runs += 1
+                    self.log(State.GAME_OVER,
+                             f"run finished -> completed runs this session: "
+                             f"{self.completed_runs}")
+                    if self.on_run_complete is not None:
+                        try:
+                            self.on_run_complete()
+                        except Exception as exc:
+                            self.log(State.GAME_OVER,
+                                     f"run-counter hook error: {exc}")
         except KeyboardInterrupt:
             print("\nOrchestrator stopped.")
 
@@ -881,6 +1093,11 @@ def _self_check() -> int:
         o._sleep_responsive = lambda *a, **k: None
         o.tap = lambda name: taps.append(name)
         o._congrats_active = lambda *a, **k: False
+        # Ticket gate degrades to 'proceed' by default (unreadable) so the golden
+        # walk isn't blocked; the ticket scenario overrides these. (_grab_watchdog_frame
+        # is left real -> falls back to MockAdb's blank screenshot.)
+        o._match_main_menu_anchor = lambda shot: -1.0
+        o._ocr_ticket_text = lambda shot: None
         for n in _await_names:
             if hasattr(o, n):
                 setattr(o, n, lambda *a, **k: None)
@@ -1019,6 +1236,32 @@ def _self_check() -> int:
     check("region sig stable on identical frame", o._captcha_region_sig(rshot) == sig0)
     check("region sig changes on sampled-pixel change",
           o._captcha_region_sig(rshot2) != sig0)
+
+    # -- T. Main-menu ticket gate ------------------------------------------- #
+    print("\n-- T. main-menu ticket gate (OCR '3/3' gating) --")
+    o = build()
+    o._match_main_menu_anchor = lambda shot: 0.9
+    o._ocr_ticket_text = lambda shot: "3/3"
+    taps.clear()
+    st = Orchestrator.handle_main_menu(o)
+    check("tickets FULL (3/3) -> BEFORE_START + play tapped",
+          st is State.BEFORE_START and "play_button" in taps)
+
+    o = build()
+    o._match_main_menu_anchor = lambda shot: 0.9
+    _seq = iter(["1/3", "2/3", "3/3"])          # tickets fill over polls
+    o._ocr_ticket_text = lambda shot: next(_seq, "3/3")
+    taps.clear()
+    st = Orchestrator.handle_main_menu(o)
+    check("tickets 1/3->2/3->3/3 -> stands by then proceeds",
+          st is State.BEFORE_START and "play_button" in taps)
+
+    o = build()                                  # unreadable -> proceed (no dead-loop)
+    o._ocr_ticket_text = lambda shot: None
+    taps.clear()
+    st = Orchestrator.handle_main_menu(o)
+    check("ticket unreadable -> proceeds (degrade, no dead-loop)",
+          st is State.BEFORE_START and "play_button" in taps)
 
     ok = all(results)
     print("\n" + "=" * 64)

@@ -1,0 +1,5 @@
+numpy==1.26.4
+opencv-python==4.9.0.80
+pytesseract==0.3.10
+pure-python-adb==0.3.0.dev0
+pynput==1.7.6
