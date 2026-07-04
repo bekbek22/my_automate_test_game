@@ -93,7 +93,7 @@ RELAY_PROMPT_REGION = (478, 277, 664, 38)   # (x, y, w, h) of the banner text
 # at t=0 so the real relay never fires. "relay"/"cookie" appear only here.
 RELAY_PROMPT_KEYWORDS = ("relay", "cookie")
 RELAY_OCR_INTERVAL_S = 0.6                   # throttle Tesseract in the 5 Hz watchdog
-RELAY_DEBUG_OCR = True                        # log the raw OCR read each check (tuning)
+RELAY_DEBUG_OCR = False                       # set True to log the raw OCR read each check (tuning)
 RELAY_ACTIVATE_COORD = BOOST_SLOT_CLICK      # relay activates at the SAME slot as boost_start (816,428)
 # Macro pause/resume handshake (cwd-relative files, shared with test_macro_io.py).
 # During the relay banner the game freezes, so we pause the macro (stop its tap
