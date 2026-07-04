@@ -3,11 +3,42 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import time
 from datetime import datetime
 
 from adb_macro_manager import Adb, Config
+
+# Pause/resume control files (shared with the orchestrator, cwd-relative). When
+# the relay banner appears the game FREEZES, so the orchestrator raises the flag,
+# the macro stops + freezes its timeline, the relay is tapped, then the flag is
+# cleared and the macro resumes exactly where it left off (no desync, no ADB
+# contention fighting the relay tap).
+PAUSE_FLAG_FILE = "macro_pause.flag"
+PAUSE_ACK_FILE = "macro_paused.ack"
+
+
+def _wait_if_paused(done) -> float:
+    """If the pause flag is raised, freeze here until it clears. Returns the
+    paused duration (s) so the caller shifts its timeline baseline forward."""
+    if not os.path.exists(PAUSE_FLAG_FILE):
+        return 0.0
+    t0 = time.monotonic()
+    try:
+        open(PAUSE_ACK_FILE, "w").close()          # ack: macro has stopped
+    except OSError:
+        pass
+    print("  [macro] PAUSED for relay...", flush=True)
+    while os.path.exists(PAUSE_FLAG_FILE) and not done():
+        time.sleep(0.02)
+    try:
+        os.remove(PAUSE_ACK_FILE)
+    except OSError:
+        pass
+    paused = time.monotonic() - t0
+    print(f"  [macro] RESUMED (+{paused:.2f}s)", flush=True)
+    return paused
 
 
 
@@ -206,6 +237,10 @@ def playback_session(in_path: str = OUTPUT_FILE, adb=None,
 
         target = start + t_ms / 1000.0
         while not done():
+            paused = _wait_if_paused(done)         # freeze while relay is handled
+            if paused:
+                start += paused                    # shift baseline -> stay aligned
+                target = start + t_ms / 1000.0
             remaining = target - time.monotonic()
             if remaining <= 0:
                 break

@@ -93,6 +93,11 @@ RELAY_PROMPT_KEYWORDS = ("relay", "activate", "cookie")
 RELAY_OCR_INTERVAL_S = 0.6                   # throttle Tesseract in the 5 Hz watchdog
 RELAY_DEBUG_OCR = True                        # log the raw OCR read each check (tuning)
 RELAY_ACTIVATE_COORD = BOOST_SLOT_CLICK      # relay activates at the SAME slot as boost_start (816,428)
+# Macro pause/resume handshake (cwd-relative files, shared with test_macro_io.py).
+# During the relay banner the game freezes, so we pause the macro (stop its tap
+# flood + freeze its timeline), tap relay cleanly, then resume it aligned.
+MACRO_PAUSE_FLAG = "macro_pause.flag"
+MACRO_PAUSE_ACK = "macro_paused.ack"
 
 GAMEPLAY_MOTION_REGION = (300, 500, 300, 300)
 GAMEPLAY_ACTIVE_MAE = 15.0
@@ -302,18 +307,44 @@ class Orchestrator:
 
     def _activate_relay(self) -> None:
         """Activate the Relay Boost by tapping the slot ('Tap to activate ...').
-        Double-tap with a short gap to beat the very brief (~1-2 s) prompt window.
 
         In MACRO mode the recorded macro floods ADB with `input tap` commands, so
         our relay tap would queue behind them and land after the banner closes.
-        Purge that backlog first (kills only in-flight `input` procs, not the macro
-        subprocess) so the relay tap lands immediately."""
-        if self.playing_mode == "macro":
-            self._purge_adb_input_buffer()
+        The game FREEZES during the banner, so we PAUSE the macro (stops the flood
+        + freezes its timeline), tap relay cleanly, then RESUME it aligned."""
+        macro = self.playing_mode == "macro"
+        if macro:
+            self._pause_macro()             # stop the tap flood + freeze timeline
+            self._purge_adb_input_buffer()  # clear any last in-flight taps
         cx, cy = RELAY_ACTIVATE_COORD
         self._tap_xy(cx, cy)
         self._sleep_responsive(0.08)
-        self._tap_xy(cx, cy)
+        self._tap_xy(cx, cy)                # double-tap for the brief window
+        if macro:
+            self._resume_macro()            # unfreeze; macro continues where it left off
+
+    def _pause_macro(self) -> None:
+        """Raise the pause flag and wait (bounded) for the macro to acknowledge it
+        has stopped, so the relay tap isn't fighting the macro's tap flood."""
+        try:
+            open(MACRO_PAUSE_FLAG, "w").close()
+        except OSError as exc:
+            self.log(State.PLAYING, f"macro pause flag error: {exc}")
+            return
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            if os.path.exists(MACRO_PAUSE_ACK):
+                self.log(State.PLAYING, "macro paused for relay")
+                return
+            time.sleep(0.02)
+        self.log(State.PLAYING, "macro pause ack timed out -- proceeding anyway")
+
+    def _resume_macro(self) -> None:
+        try:
+            os.remove(MACRO_PAUSE_FLAG)
+        except OSError:
+            pass
+        self.log(State.PLAYING, "macro resumed")
 
     def _ocr_region_text(self, shot, region, *, whitelist=None, psm=7,
                          upscale=2, invert=False) -> "Optional[str]":
@@ -544,6 +575,11 @@ class Orchestrator:
 
         self._watchdog_detected = None
         self._relay_used = False           # new run: relay/revive not yet used
+        for f in (MACRO_PAUSE_FLAG, MACRO_PAUSE_ACK):   # clear any stale handshake
+            try:
+                os.remove(f)
+            except OSError:
+                pass
         stop_evt = threading.Event()
         wd = threading.Thread(target=self._background_watchdog_loop,
                               args=(proc, stop_evt), daemon=True)

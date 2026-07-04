@@ -18,6 +18,10 @@ debug/
 session.json
 macro_output.json
 
+# Runtime pause/resume handshake files (macro <-> orchestrator)
+macro_pause.flag
+macro_paused.ack
+
 # Third-party ADB binaries (install platform-tools separately; keep on PATH)
 adb.exe
 AdbWinApi.dll
