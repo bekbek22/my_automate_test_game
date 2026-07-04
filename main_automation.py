@@ -319,9 +319,9 @@ class Orchestrator:
             self._pause_macro()             # stop the tap flood + freeze timeline
             self._purge_adb_input_buffer()  # clear any last in-flight taps
         cx, cy = RELAY_ACTIVATE_COORD
-        self._tap_xy(cx, cy)
-        self._sleep_responsive(0.08)
-        self._tap_xy(cx, cy)                # double-tap for the brief window
+        self._tap_xy(cx, cy)                # single tap: the game freezes & waits,
+                                            # so one tap activates it; a 2nd tap would
+                                            # land on the just-unfrozen 2nd runner
         if macro:
             self._resume_macro()            # unfreeze; macro continues where it left off
 
