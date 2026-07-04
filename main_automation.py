@@ -57,6 +57,8 @@ STOP_TIMEOUT_S = 20.0
 
 RESULT_REGION = (523, 43, 556, 99)
 MYSTERY_BOX_REGION = (592, 50, 431, 103)
+MYSTERY_BOX_TEXT = "mystery box"       # OCR needle gating the open-box phase
+BOX_DETECT_TIMEOUT_S = 3.0             # how long to look for the box before skipping
 BUY_UPGRADES_REGION = (192, 119, 270, 43)
 BUY_UPGRADES_TARGET_RGB = (224, 224, 224)
 
@@ -326,54 +328,79 @@ class Orchestrator:
             self.log(State.PLAYING, f"icon match error: {exc}")
             return False
 
-    def _ocr_ticket_text(self, shot) -> "Optional[str]":
-        """OCR the ticket cap ("x/3") from MAIN_MENU_TICKET_REGION. Upscales +
-        grayscales + Otsu-thresholds the crop, whitelists digits/slash, and
-        regex-extracts the pattern. Returns e.g. '3/3', or None if unreadable /
-        the OCR stack is unavailable (-> caller proceeds, no dead-loop)."""
+    def _ocr_region_text(self, shot, region, *, whitelist=None, psm=7,
+                         upscale=2) -> "Optional[str]":
+        """Generic region OCR shared by the ticket + mystery-box gates. Crops the
+        region, grayscales, upscales (>= 2x), Otsu-binarizes, then runs Tesseract.
+        Returns the recognized text (possibly ''), or None if the OCR stack is
+        unavailable so each caller can pick its own degrade policy."""
         try:
-            import re
             import cv2
             import find_the_card as ftc              # configures pytesseract path
             pyt = getattr(ftc, "pytesseract", None)
             if pyt is None:
                 return None
-            x, y, w, h = MAIN_MENU_TICKET_REGION
-            roi = self._shot_to_bgr(shot)[y:y + h, x:x + w]
-            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-            gray = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+            x, y, w, h = region
+            gray = cv2.cvtColor(self._shot_to_bgr(shot)[y:y + h, x:x + w],
+                                cv2.COLOR_BGR2GRAY)
+            gray = cv2.resize(gray, None, fx=upscale, fy=upscale,
+                              interpolation=cv2.INTER_CUBIC)
             gray = cv2.threshold(gray, 0, 255,
                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-            txt = pyt.image_to_string(
-                gray, config="--psm 7 -c tessedit_char_whitelist=0123456789/")
-            match = re.search(r"([0-3])\s*/\s*3", txt)
-            return f"{match.group(1)}/3" if match else None
+            cfg = f"--psm {psm}"
+            if whitelist:
+                cfg += f" -c tessedit_char_whitelist={whitelist}"
+            return pyt.image_to_string(gray, config=cfg)
         except Exception as exc:
-            self.log(State.MAIN_MENU, f"ticket OCR error: {exc}")
+            self.log(State.MAIN_MENU, f"region OCR error: {exc}")
             return None
+
+    def _ocr_ticket_text(self, shot) -> "Optional[str]":
+        """OCR the ticket cap ("x/3") from MAIN_MENU_TICKET_REGION (grayscale +
+        3x upscale + Otsu, digit/slash whitelist) and regex-extract the pattern.
+        Returns e.g. '3/3', or None if unreadable / the OCR stack is unavailable."""
+        txt = self._ocr_region_text(shot, MAIN_MENU_TICKET_REGION,
+                                    whitelist="0123456789/", upscale=3)
+        if txt is None:
+            return None
+        import re
+        match = re.search(r"([0-3])\s*/\s*3", txt)
+        return f"{match.group(1)}/3" if match else None
+
+    def _mystery_box_present(self, shot) -> bool:
+        """True when the OCR of MYSTERY_BOX_REGION contains 'Mystery Box'
+        (case-insensitive). False if the text is absent or the OCR stack is
+        unavailable, so the open-box phase is skipped rather than tapping blind."""
+        txt = self._ocr_region_text(shot, MYSTERY_BOX_REGION)
+        return bool(txt) and MYSTERY_BOX_TEXT in txt.lower()
 
     def handle_main_menu(self) -> State:
         self._throttle()
-        # TICKET GATE: only start a match when tickets are full ("3/3"). The
-        # template match doubles as a MAIN_MENU state anchor (logged). Degrades
-        # to 'proceed' when the ticket text can't be read so it never dead-loops.
+        # PRE-FLIGHT TICKET GATE (fail-safe). Start a match ONLY when the tickets
+        # read a strict "3/3". Anything less, unreadable, or garbage -> stand by.
+        #  * Anchor guard: require _match_main_menu_anchor() >= threshold before
+        #    trusting the OCR. A definitive low match (0 <= conf < threshold) means
+        #    we're not on MAIN_MENU -> skip OCR this frame (no reading garbage).
+        #    conf < 0 = anchor can't run (no cv2/template) -> fall through so a
+        #    healthy OCR stack still gates (no hard dead-loop on a missing asset).
         while self.running:
             shot = self._grab_watchdog_frame()
             conf = self._match_main_menu_anchor(shot)
-            anchor = ("confirmed" if conf >= TICKET_MATCH_THRESHOLD
-                      else "n/a" if conf < 0 else f"low({conf:.2f})")
-            text = self._ocr_ticket_text(shot)
+            if 0.0 <= conf < TICKET_MATCH_THRESHOLD:
+                self.log(State.MAIN_MENU,
+                         f"[orchestrator] MAIN_MENU not confirmed (anchor={conf:.2f}). "
+                         "Standing by...")
+                self._sleep_responsive(TICKET_RECHECK_S)
+                continue
 
-            if text is None:
-                self.log(State.MAIN_MENU,
-                         f"MAIN_MENU anchor={anchor}; ticket unreadable -> proceeding")
-                break
+            text = self._ocr_ticket_text(shot)
             if text == TICKET_FULL:
-                self.log(State.MAIN_MENU,
-                         f"MAIN_MENU anchor={anchor}; tickets FULL ({text}) -> start")
+                self.log(State.MAIN_MENU, f"tickets FULL ({text}) -> starting match")
                 break
+
             self.log(State.MAIN_MENU,
-                     f"[orchestrator] Tickets are not full yet ({text}). Standing by...")
+                     "[orchestrator] Tickets not ready or unreadable "
+                     f"({text if text else 'unreadable'}). Standing by...")
             self._sleep_responsive(TICKET_RECHECK_S)
 
         if not self.running:
@@ -720,19 +747,28 @@ class Orchestrator:
 
     def handle_open_box(self) -> State:
         self._throttle()
-        self.log(State.OPEN_BOX, "awaiting Mystery Box screen")
-        self._await_region_settled(MYSTERY_BOX_REGION, State.OPEN_BOX, "MYSTERY_BOX")
+        # MYSTERY BOX GATE: never tap the open-box coords blind. Confirm the
+        # "Mystery Box" title via OCR first; if it never appears within the
+        # detect window, skip the whole phase and move on.
+        waited = 0.0
+        while self.running and waited < BOX_DETECT_TIMEOUT_S:
+            if self._mystery_box_present(self._grab_watchdog_frame()):
+                self.log(State.OPEN_BOX, "Mystery Box detected -> opening all boxes")
+                self.tap("open_all_button")
 
-        self.log(State.OPEN_BOX, "opening all boxes")
-        self.tap("open_all_button")
+                wait = random.uniform(BOX_ANIM_MIN_S, BOX_ANIM_MAX_S)
+                self.log(State.OPEN_BOX, f"waiting {wait:.1f}s for reward animation")
+                self._sleep_responsive(wait)
 
-        wait = random.uniform(BOX_ANIM_MIN_S, BOX_ANIM_MAX_S)
-        self.log(State.OPEN_BOX, f"waiting {wait:.1f}s for reward animation")
-        self._sleep_responsive(wait)
+                self.log(State.OPEN_BOX, "dismissing rewards")
+                self.tap("open_all_button")
+                self.sleep_human(1.5)
+                return State.LEVEL_UP
+            self._sleep_responsive(STOP_POLL_INTERVAL_S)
+            waited += STOP_POLL_INTERVAL_S
 
-        self.log(State.OPEN_BOX, "dismissing rewards")
-        self.tap("open_all_button")
-        self.sleep_human(1.5)
+        self.log(State.OPEN_BOX,
+                 "[orchestrator] No Mystery Box detected on screen. Skipping box phase.")
         return State.LEVEL_UP
 
     def handle_level_up(self) -> State:
@@ -1156,11 +1192,13 @@ def _self_check() -> int:
         o._sleep_responsive = lambda *a, **k: None
         o.tap = lambda name: taps.append(name)
         o._congrats_active = lambda *a, **k: False
-        # Ticket gate degrades to 'proceed' by default (unreadable) so the golden
-        # walk isn't blocked; the ticket scenario overrides these. (_grab_watchdog_frame
+        # Happy-path OCR gates by default so the golden walk proceeds (anchor
+        # confirmed, tickets full, mystery box present); the T / X scenarios
+        # override these to exercise the fail-safe branches. (_grab_watchdog_frame
         # is left real -> falls back to MockAdb's blank screenshot.)
-        o._match_main_menu_anchor = lambda shot: -1.0
-        o._ocr_ticket_text = lambda shot: None
+        o._match_main_menu_anchor = lambda shot: 0.9
+        o._ocr_ticket_text = lambda shot: TICKET_FULL
+        o._mystery_box_present = lambda shot: True
         for n in _await_names:
             if hasattr(o, n):
                 setattr(o, n, lambda *a, **k: None)
@@ -1300,8 +1338,8 @@ def _self_check() -> int:
     check("region sig changes on sampled-pixel change",
           o._captcha_region_sig(rshot2) != sig0)
 
-    # -- T. Main-menu ticket gate ------------------------------------------- #
-    print("\n-- T. main-menu ticket gate (OCR '3/3' gating) --")
+    # -- T. Main-menu ticket gate (fail-safe) ------------------------------- #
+    print("\n-- T. main-menu ticket gate (anchor guard + '3/3' fail-safe) --")
     o = build()
     o._match_main_menu_anchor = lambda shot: 0.9
     o._ocr_ticket_text = lambda shot: "3/3"
@@ -1319,12 +1357,41 @@ def _self_check() -> int:
     check("tickets 1/3->2/3->3/3 -> stands by then proceeds",
           st is State.BEFORE_START and "play_button" in taps)
 
-    o = build()                                  # unreadable -> proceed (no dead-loop)
+    o = build()                                  # unreadable -> FAIL-SAFE standby
+    o._match_main_menu_anchor = lambda shot: 0.9
     o._ocr_ticket_text = lambda shot: None
+    o._sleep_responsive = lambda *a, **k: setattr(o, "running", False)
     taps.clear()
     st = Orchestrator.handle_main_menu(o)
-    check("ticket unreadable -> proceeds (degrade, no dead-loop)",
-          st is State.BEFORE_START and "play_button" in taps)
+    check("ticket unreadable -> FAIL-SAFE standby (holds MAIN_MENU, no play tap)",
+          st is State.MAIN_MENU and "play_button" not in taps)
+
+    o = build()                                  # anchor low -> skip OCR, stand by
+    o._match_main_menu_anchor = lambda shot: 0.30
+    def _no_ocr(shot):
+        raise AssertionError("OCR must be skipped when anchor < threshold")
+    o._ocr_ticket_text = _no_ocr
+    o._sleep_responsive = lambda *a, **k: setattr(o, "running", False)
+    taps.clear()
+    st = Orchestrator.handle_main_menu(o)
+    check("anchor low (<0.75) -> skips OCR + stands by (no play tap)",
+          st is State.MAIN_MENU and "play_button" not in taps)
+
+    # -- X. Mystery-box text gate (OPEN_BOX) -------------------------------- #
+    print("\n-- X. mystery-box text gate (OCR 'Mystery Box') --")
+    o = build()
+    o._mystery_box_present = lambda shot: True
+    taps.clear()
+    st = Orchestrator.handle_open_box(o)
+    check("Mystery Box present -> opens + dismisses (2 taps) -> LEVEL_UP",
+          st is State.LEVEL_UP and taps.count("open_all_button") == 2)
+
+    o = build()
+    o._mystery_box_present = lambda shot: False
+    taps.clear()
+    st = Orchestrator.handle_open_box(o)
+    check("no Mystery Box -> skips box phase (0 taps) -> LEVEL_UP",
+          st is State.LEVEL_UP and "open_all_button" not in taps)
 
     ok = all(results)
     print("\n" + "=" * 64)
