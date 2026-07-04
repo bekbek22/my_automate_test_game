@@ -87,9 +87,11 @@ BOOST_SLOT_CLICK = (816, 428)
 # slot ONCE per run (gated by the Enable Relay toggle). In Macro mode this is the
 # only thing the watchdog taps (the recorded macro owns the initial boost).
 RELAY_PROMPT_REGION = (478, 277, 664, 38)   # (x, y, w, h) of the banner text
-# "Tap to activate Cookie Relay Boost!" -- match ANY keyword so a single OCR
-# misread ("Reiay", "C0okie"...) doesn't drop the whole detection.
-RELAY_PROMPT_KEYWORDS = ("relay", "activate", "cookie")
+# "Tap to activate Cookie Relay Boost!" -- match only words UNIQUE to the relay
+# banner. NOT "activate"/"boost": the initial-boost banner "Tap to activate Fast
+# Start Boost!" shares those, and matching it would burn the one-shot relay flag
+# at t=0 so the real relay never fires. "relay"/"cookie" appear only here.
+RELAY_PROMPT_KEYWORDS = ("relay", "cookie")
 RELAY_OCR_INTERVAL_S = 0.6                   # throttle Tesseract in the 5 Hz watchdog
 RELAY_DEBUG_OCR = True                        # log the raw OCR read each check (tuning)
 RELAY_ACTIVATE_COORD = BOOST_SLOT_CLICK      # relay activates at the SAME slot as boost_start (816,428)
