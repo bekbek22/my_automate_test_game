@@ -290,6 +290,9 @@ class Orchestrator:
         RELAY_PROMPT_KEYWORDS so one misread word doesn't drop the detection.
         Reliable relay/revive trigger for BOTH Macro and Long Run; False if the
         text is absent or the OCR stack is unavailable."""
+        # Single normal-polarity pass: relay_probe verified this reads the banner
+        # cleanly ("Tap to activate Cookie Relay Boost!"), so one OCR keeps the
+        # watchdog fast enough not to miss the brief (~3 s) window.
         txt = self._ocr_region_text(shot, RELAY_PROMPT_REGION, upscale=3)
         low = (txt or "").lower()
         hit = any(kw in low for kw in RELAY_PROMPT_KEYWORDS)
@@ -306,11 +309,12 @@ class Orchestrator:
         self._tap_xy(cx, cy)
 
     def _ocr_region_text(self, shot, region, *, whitelist=None, psm=7,
-                         upscale=2) -> "Optional[str]":
-        """Generic region OCR shared by the ticket + mystery-box gates. Crops the
-        region, grayscales, upscales (>= 2x), Otsu-binarizes, then runs Tesseract.
-        Returns the recognized text (possibly ''), or None if the OCR stack is
-        unavailable so each caller can pick its own degrade policy."""
+                         upscale=2, invert=False) -> "Optional[str]":
+        """Generic region OCR shared by the ticket + mystery-box + relay gates.
+        Crops the region, grayscales, upscales (>= 2x), Otsu-binarizes, then runs
+        Tesseract. `invert=True` flips the binarization (for light text on a dark
+        background, which Tesseract otherwise reads as inverted). Returns the text
+        (possibly ''), or None if the OCR stack is unavailable."""
         try:
             import cv2
             import find_the_card as ftc              # configures pytesseract path
@@ -322,8 +326,8 @@ class Orchestrator:
                                 cv2.COLOR_BGR2GRAY)
             gray = cv2.resize(gray, None, fx=upscale, fy=upscale,
                               interpolation=cv2.INTER_CUBIC)
-            gray = cv2.threshold(gray, 0, 255,
-                                 cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+            thr = cv2.THRESH_BINARY_INV if invert else cv2.THRESH_BINARY
+            gray = cv2.threshold(gray, 0, 255, thr + cv2.THRESH_OTSU)[1]
             cfg = f"--psm {psm}"
             if whitelist:
                 cfg += f" -c tessedit_char_whitelist={whitelist}"
