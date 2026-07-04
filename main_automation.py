@@ -301,8 +301,15 @@ class Orchestrator:
         return hit
 
     def _activate_relay(self) -> None:
-        """Activate the Relay Boost by tapping the banner ('Tap to activate ...').
-        Double-tap with a short gap to beat the very brief (~1-2 s) prompt window."""
+        """Activate the Relay Boost by tapping the slot ('Tap to activate ...').
+        Double-tap with a short gap to beat the very brief (~1-2 s) prompt window.
+
+        In MACRO mode the recorded macro floods ADB with `input tap` commands, so
+        our relay tap would queue behind them and land after the banner closes.
+        Purge that backlog first (kills only in-flight `input` procs, not the macro
+        subprocess) so the relay tap lands immediately."""
+        if self.playing_mode == "macro":
+            self._purge_adb_input_buffer()
         cx, cy = RELAY_ACTIVATE_COORD
         self._tap_xy(cx, cy)
         self._sleep_responsive(0.08)
