@@ -72,18 +72,24 @@ CAPTCHA_OCR_REGION = (492, 43, 722, 71)
 CAPTCHA_CACHE_TTL_S = 0.5
 CAPTCHA_CACHE_STRIDE = 8
 
-# Long Run auto boost/relay: pure pixel-colour reflex. When the support icon is
-# present in BONUS_ICON_REGION (REFLEX_TARGET_BLUE density), tap the boost/relay
-# slots -- each strictly gated by its GUI toggle (long_run_boost_enabled /
-# long_run_relay_enabled). No image/template matching here.
+# Long Run auto boost/relay: OpenCV template matching. When either support-icon
+# template (Ninja Cookie / Blue Rocket) matches inside BONUS_ICON_REGION, a rising
+# edge is classified by the sequence counter (1st = Boost, rest = Relay) and gated
+# by its GUI toggle (long_run_boost_enabled / long_run_relay_enabled). The dynamic
+# item counts ("9", "56") on each icon are masked out (top-right quarter blacked on
+# both template and ROI) so only the core artwork drives the match. Degrades
+# gracefully to "no icon" if cv2/the assets are missing (never a dead-loop).
 BONUS_ICON_REGION = (725, 334, 183, 188)
-REFLEX_TARGET_BLUE = (32, 74, 124)
+REFLEX_TARGET_BLUE = (32, 74, 124)          # (legacy colour ref, still used by long_run reflex)
 REFLEX_TOLERANCE = 50
 REFLEX_REQUIRED_RATIO = 0.05
 BOOST_SLOT_CLICK = (816, 428)
 RELAY_SLOT_CLICK = (860, 620)
-# Macro-watchdog boost/relay reflex (pure pixel-colour, per-toggle gated).
-RELAY_ARM_DELAY_S = 30.0            # relay only armed after the boost/setup phase
+_ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+BOOST_TEMPLATE_PATH = os.path.join(_ASSET_DIR, "boost_start.png")   # Ninja Cookie
+RELAY_TEMPLATE_PATH = os.path.join(_ASSET_DIR, "relay.png")         # Blue Rocket
+ICON_MATCH_THRESHOLD = 0.75         # cv2 matchTemplate confidence -> icon present
+# Macro-watchdog boost/relay reflex (template match, edge-triggered, per-toggle gated).
 RELAY_REVIVE_COOLDOWN_S = 4.0       # min gap between relay revive taps
 BOOST_TAP_COOLDOWN_S = 4.0          # min gap between boost taps (anti 5Hz spam)
 
@@ -261,6 +267,64 @@ class Orchestrator:
         except Exception as exc:
             self.log(State.MAIN_MENU, f"anchor match error: {exc}")
             return -1.0
+
+    @staticmethod
+    def _mask_top_right_quarter(img):
+        """Black out the top-right 25% quarter (x: w/2..w, y: 0..h/2) so the
+        dynamic item counts printed on the boost/relay icons are hidden and only
+        the core graphic artwork drives the match."""
+        h, w = img.shape[:2]
+        img[0:h // 2, w // 2:w] = 0
+        return img
+
+    def _boost_relay_templates(self):
+        """Cached list of masked grayscale templates (Ninja Cookie + Blue Rocket),
+        each resized to BONUS_ICON_REGION so matchTemplate is a deterministic
+        full-overlap correlation, with the top-right quarter blacked out. Empty
+        list if cv2/the assets are unavailable (-> watchdog sees 'no icon')."""
+        if getattr(self, "_icon_tmpl_cache", None) is None:
+            self._icon_tmpl_cache = []
+            try:
+                import cv2
+                _, _, w, h = BONUS_ICON_REGION
+                for path in (BOOST_TEMPLATE_PATH, RELAY_TEMPLATE_PATH):
+                    if not os.path.exists(path):
+                        self.log(State.PLAYING, f"icon template missing: {path}")
+                        continue
+                    g = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+                    if g is None:
+                        self.log(State.PLAYING, f"icon template unreadable: {path}")
+                        continue
+                    g = cv2.resize(g, (w, h))
+                    self._icon_tmpl_cache.append(self._mask_top_right_quarter(g))
+            except Exception as exc:
+                self.log(State.PLAYING, f"icon template load error: {exc}")
+        return self._icon_tmpl_cache
+
+    def _bonus_icon_present(self, shot) -> bool:
+        """True when either masked boost/relay template matches BONUS_ICON_REGION
+        at >= ICON_MATCH_THRESHOLD confidence. The live ROI is masked identically
+        (top-right quarter blacked) so the on-screen item numbers never affect the
+        score. Returns False (never blocks the run) if cv2/the assets are missing."""
+        try:
+            import cv2
+            templates = self._boost_relay_templates()
+            if not templates:
+                return False
+            x, y, w, h = BONUS_ICON_REGION
+            roi = self._shot_to_bgr(shot)[y:y + h, x:x + w]
+            if roi.shape[0] != h or roi.shape[1] != w:      # region off-frame
+                return False
+            roi_g = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            roi_g = self._mask_top_right_quarter(roi_g)
+            for tmpl in templates:
+                res = cv2.matchTemplate(roi_g, tmpl, cv2.TM_CCOEFF_NORMED)
+                if float(res.max()) >= ICON_MATCH_THRESHOLD:
+                    return True
+            return False
+        except Exception as exc:
+            self.log(State.PLAYING, f"icon match error: {exc}")
+            return False
 
     def _ocr_ticket_text(self, shot) -> "Optional[str]":
         """OCR the ticket cap ("x/3") from MAIN_MENU_TICKET_REGION. Upscales +
@@ -507,10 +571,10 @@ class Orchestrator:
         """Macro-mode screen watchdog (5 Hz, PNG frames). PURE PIXEL-COLOUR -- no
         template matching. Priority + SEQUENCE-COUNTER gating:
           1. Captcha (OCR, cached) -> CAPTCHA (terminate).
-          2. BONUS_ICON colour event (edge-triggered: only the absent->present
-             transition counts, so one on-screen icon = one event regardless of
-             the 5 Hz sampling rate). Each event is classified by the sequence
-             counter self._boost_slot_click_count:
+          2. BONUS_ICON template-match event (masked cv2 matchTemplate; edge-
+             triggered: only the absent->present transition counts, so one on-screen
+             icon = one event regardless of the 5 Hz sampling rate). Each event is
+             classified by the sequence counter self._boost_slot_click_count:
                * count == 0  -> INITIAL BOOST. Tap "boost_slot" ONLY if
                                 long_run_boost_enabled. Counter advances either way
                                 so the NEXT event is treated as a relay.
@@ -529,11 +593,10 @@ class Orchestrator:
                 if self._captcha_active_cached(shot):   # captcha has priority
                     detected = State.CAPTCHA
                 else:
-                    # ---- Single BONUS_ICON colour read, edge-triggered so one
-                    # visible icon fires exactly once (no 5 Hz double-counting). --
-                    icon_present = (self._region_color_ratio(
-                        BONUS_ICON_REGION, REFLEX_TARGET_BLUE,
-                        REFLEX_TOLERANCE, shot=shot) >= REFLEX_REQUIRED_RATIO)
+                    # ---- Single BONUS_ICON template match (masked, cv2), edge-
+                    # triggered so one visible icon fires exactly once (no 5 Hz
+                    # double-counting). Either template >= threshold -> present. --
+                    icon_present = self._bonus_icon_present(shot)
 
                     if icon_present and not icon_present_prev:   # rising edge = event
                         if self._boost_slot_click_count == 0:
