@@ -74,12 +74,7 @@ CAPTCHA_OCR_REGION = (492, 43, 722, 71)
 CAPTCHA_CACHE_TTL_S = 0.5
 CAPTCHA_CACHE_STRIDE = 8
 
-# Boost/Relay support-icon region (Long Run boost reflex uses its blue-pixel density).
-BONUS_ICON_REGION = (725, 334, 183, 188)
-REFLEX_TARGET_BLUE = (32, 74, 124)          # Long Run boost-icon colour signature
-REFLEX_TOLERANCE = 50
-REFLEX_REQUIRED_RATIO = 0.05
-BOOST_SLOT_CLICK = (816, 428)
+BOOST_SLOT_CLICK = (816, 428)               # boost / relay activation slot
 
 # Relay/revive trigger (BOTH modes): the "Tap to activate Cookie Relay Boost!" banner.
 # Detected by OCR text (contains "relay") -- far more reliable than icon matching,
@@ -95,6 +90,11 @@ RELAY_PROMPT_KEYWORDS = ("relay", "cookie")
 RELAY_OCR_INTERVAL_S = 0.6                   # throttle Tesseract in the 5 Hz watchdog
 RELAY_DEBUG_OCR = False                       # set True to log the raw OCR read each check (tuning)
 RELAY_ACTIVATE_COORD = BOOST_SLOT_CLICK      # relay activates at the SAME slot as boost_start (816,428)
+# Initial-boost trigger (LONG RUN only; in Macro mode the recorded macro owns it):
+# the "Tap to activate Fast Start Boost!" banner -- SAME region as the relay banner,
+# matched by words unique to it ("fast"/"start", never the shared "activate"/"boost").
+# Fired ONCE per run at the boost slot, gated by Enable Boost Start.
+BOOST_PROMPT_KEYWORDS = ("fast", "start")
 # Macro pause/resume handshake (cwd-relative files, shared with test_macro_io.py).
 # During the relay banner the game freezes, so we pause the macro (stop its tap
 # flood + freeze its timeline), tap relay cleanly, then resume it aligned.
@@ -182,9 +182,11 @@ class Orchestrator:
         self.completed_runs = 0
         self.on_run_complete = None
 
-        # One-shot guard: relay/revive fires at most once per run. Reset at the
-        # start of every run (macro: _run_macro_subprocess; long_run: _monitor_match).
+        # One-shot guards: relay/revive and (long-run) initial boost each fire at
+        # most once per run. Reset at the start of every run (macro:
+        # _run_macro_subprocess; long_run: _monitor_match).
         self._relay_used = False
+        self._boost_used = False
 
         self._init_debug_log()
 
@@ -306,6 +308,14 @@ class Orchestrator:
         if RELAY_DEBUG_OCR:
             self.log(State.PLAYING, f"[relay-ocr] read={txt!r} -> {hit}")
         return hit
+
+    def _boost_prompt_present(self, shot) -> bool:
+        """True when the 'Tap to activate Fast Start Boost!' banner is up (LONG RUN
+        initial boost). Same region as the relay banner; match 'fast'/'start' to
+        distinguish it from the 'Cookie Relay Boost!' banner."""
+        txt = self._ocr_region_text(shot, RELAY_PROMPT_REGION, upscale=3)
+        low = (txt or "").lower()
+        return any(kw in low for kw in BOOST_PROMPT_KEYWORDS)
 
     def _activate_relay(self) -> None:
         """Activate the Relay Boost by tapping the slot ('Tap to activate ...').
@@ -903,6 +913,7 @@ class Orchestrator:
     def _monitor_match(self) -> State:
         self.log(State.PLAYING, "monitoring match: scanning captcha + game-over")
         self._relay_used = False           # new run: relay/revive not yet used
+        self._boost_used = False           # new run: initial boost not yet used
         while self.running:
             self._sleep_responsive(1.0)
             if not self.running:
@@ -929,18 +940,15 @@ class Orchestrator:
                          "RESULT banner confirmed (no captcha) -> GAME_OVER (-> OPEN_BOX)")
                 return State.GAME_OVER
             if self.playing_mode == "long_run":
-                # STRICTLY gated per GUI toggle:
-                #  * Boost  -> blue-pixel density of the support icon (BONUS_ICON).
-                #  * Relay  -> OCR of the "Cookie Relay Boost!" banner, ONCE per run.
-                # Each check is skipped entirely when its toggle is OFF (no
-                # competing trigger, no wasted OCR).
-                if self.long_run_boost_enabled:
-                    boost_present = self._region_color_ratio(
-                        BONUS_ICON_REGION, REFLEX_TARGET_BLUE,
-                        REFLEX_TOLERANCE, shot=shot) >= REFLEX_REQUIRED_RATIO
-                    if boost_present:
-                        self.tap("boost_slot")
-                        self.log(State.PLAYING, "long-run reflex: Boost tap (boost_slot)")
+                # Boost + Relay each detected by their OWN "Tap to activate ...
+                # Boost!" banner (OCR), fired ONCE per run, STRICTLY gated by their
+                # toggle. Each check is skipped entirely when its toggle is OFF.
+                if (self.long_run_boost_enabled and not self._boost_used
+                        and self._boost_prompt_present(shot)):
+                    self.tap("boost_slot")
+                    self._boost_used = True
+                    self.log(State.PLAYING,
+                             "long-run reflex: Fast Start Boost activated (boost_slot)")
 
                 if (self.long_run_relay_enabled and not self._relay_used
                         and self._relay_prompt_present(shot)):
