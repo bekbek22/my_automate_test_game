@@ -161,7 +161,9 @@ def record_session(out_path: str = OUTPUT_FILE,
     }
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2)
-    print(f"Saved {len(events)} event(s) -> {out_path}")
+    downs = sum(1 for e in events if e.get("state") == "down")
+    print(f"Saved {len(events)} event(s) = {downs} move(s) (down+up pairs) "
+          f"-> {out_path}")
     return data
 
 
@@ -226,9 +228,10 @@ def playback_session(in_path: str = OUTPUT_FILE, adb=None,
 
     with open(in_path, "r", encoding="utf-8") as fh:
         data = json.load(fh)
-    moves = _build_moves(data.get("events", []))
-    print(f"Playing {len(moves)} move(s) from {in_path} "
-          f"(macro={data.get('macro_name')!r}). t=0 starts now.")
+    events = data.get("events", [])
+    moves = _build_moves(events)
+    print(f"Playing {len(moves)} move(s) [{len(events)} down/up events] from "
+          f"{in_path} (macro={data.get('macro_name')!r}). t=0 starts now.")
 
     start = time.monotonic()
     for t_ms, action, duration in moves:

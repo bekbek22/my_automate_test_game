@@ -17,6 +17,7 @@ debug/
 # Recorded macro data (regenerate with test_macro_io.py record)
 session.json
 macro_output.json
+macro/*.json
 
 # Runtime pause/resume handshake files (macro <-> orchestrator)
 macro_pause.flag

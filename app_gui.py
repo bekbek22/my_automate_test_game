@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import queue
 import subprocess
 import sys
@@ -11,6 +12,7 @@ import tkinter as tk
 from tkinter import ttk, scrolledtext
 
 CONFIG_FILE = "gui_config.json"
+MACRO_DIR = "macro"                 # recorded macros live here (one .json per macro)
 
 import main_automation as M
 from main_automation import Orchestrator
@@ -230,10 +232,19 @@ class AutomationGUI(tk.Tk):
         macro_box = ttk.LabelFrame(sidebar, text="Macro Configuration")
         macro_box.pack(**gp)
         macro_box.columnconfigure(1, weight=1)
-        ttk.Label(macro_box, text="Name").grid(row=0, column=0, sticky="w")
-        self.name_var = tk.StringVar(value=s.get("macro_name", "session"))
-        ttk.Entry(macro_box, textvariable=self.name_var).grid(
-            row=0, column=1, sticky="ew", padx=(4, 0), pady=1)
+        ttk.Label(macro_box, text="Macro").grid(row=0, column=0, sticky="w")
+        _macros = self._scan_macros()
+        _default = s.get("macro_name", "")
+        if _default not in _macros:
+            _default = _macros[0] if _macros else "session"
+        self.name_var = tk.StringVar(value=_default)
+        # Editable dropdown: pick an existing macro from the macro/ folder, or type
+        # a new name to record to. The list refreshes each time it's opened.
+        self.macro_combo = ttk.Combobox(macro_box, textvariable=self.name_var,
+                                        values=_macros)
+        self.macro_combo.grid(row=0, column=1, sticky="ew", padx=(4, 0), pady=1)
+        self.macro_combo.configure(postcommand=lambda: self.macro_combo.configure(
+            values=self._scan_macros()))
         ttk.Label(macro_box, text="Cycles").grid(row=1, column=0, sticky="w")
         self.loops_var = tk.StringVar(value=str(s.get("cycles", -1)))
         ttk.Entry(macro_box, textvariable=self.loops_var).grid(
@@ -294,11 +305,19 @@ class AutomationGUI(tk.Tk):
         self._save_config()
         self._append(f"[LONG RUN] Boost Start={boost}  Relay={relay}\n")
 
+    def _scan_macros(self) -> list:
+        """Sorted list of macro base-names (no .json) in the macro/ folder."""
+        try:
+            return sorted(f[:-5] for f in os.listdir(MACRO_DIR)
+                          if f.lower().endswith(".json"))
+        except OSError:
+            return []
+
     def _macro_path(self) -> str:
         name = self.name_var.get().strip() or "session"
         if name.lower().endswith(".json"):
             name = name[:-5]
-        return f"{name}.json"
+        return os.path.join(MACRO_DIR, f"{name}.json")
 
     def _load_config(self) -> dict:
         try:
@@ -429,6 +448,7 @@ class AutomationGUI(tk.Tk):
 
     def _on_record(self) -> None:
         self._save_config()
+        os.makedirs(MACRO_DIR, exist_ok=True)      # ensure macro/ exists
         path = self._macro_path()
 
         def target():
