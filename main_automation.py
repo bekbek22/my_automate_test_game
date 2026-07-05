@@ -127,11 +127,13 @@ TICKET_MATCH_THRESHOLD = 0.75                   # cv2 matchTemplate confidence
 # the reward, then return to MAIN_MENU. All four targets are (x, y, w, h) regions;
 # each tap lands on the region CENTER.
 TICKET_GET_REGION = (610, 87, 98, 31)          # red "Get!" balloon text (OCR detect)
-TICKET_GET_TAP_REGION = (588, 107, 134, 62)    # button to tap to open the reward (claim)
+TICKET_GET_TAP_REGION = (588, 107, 134, 62)    # tap the "Get!" balloon -> reward screen
+REWARD_CLAIM_REGION = (682, 684, 251, 82)      # claim-reward button on the reward screen
 CONGRATS_REGION = (527, 121, 545, 70)          # "Congratulations!" text (OCR detect)
 CONGRATS_CONFIRM_REGION = (643, 674, 322, 82)  # "Confirm" button on the congrats popup
 CLOSE_MENU_COORDS = (1323, 173, 44, 38)        # close-menu (X) button
 CONGRATS_POLL_TIMEOUT_S = 5.0                  # max wait for "Congratulations!" text
+CLAIM_STEP_DELAY_S = 2.5                        # settle before Confirm / X taps
 
 COORDS: Dict[str, tuple[int, int]] = {
     "play_button":      (1191, 806),
@@ -454,20 +456,24 @@ class Orchestrator:
         popup (OCR), tap Confirm, close the popup (X), back to MAIN_MENU. Confirm +
         close are tapped even if the OCR misses (best-effort) so a bad read can't
         leave the popup stuck open."""
-        # a. tap the claim button to open the reward
+        # a. tap the "Get!" balloon -> reward screen
         self._tap_region_center(TICKET_GET_TAP_REGION)
-        # b. wait for the "Congratulations!" popup to render (bounded OCR poll)
+        self._sleep_responsive(CLAIM_STEP_DELAY_S)          # reward screen render
+        # b. tap the claim-reward button
+        self._tap_region_center(REWARD_CLAIM_REGION)
+        # c. wait for the "Congratulations!" popup to render (bounded OCR poll)
         seen = self._await_text(CONGRATS_REGION, "congratulations",
                                 CONGRATS_POLL_TIMEOUT_S)
         self.log(State.MAIN_MENU,
                  f"'Congratulations!' {'confirmed' if seen else 'not seen'} "
                  "-> tapping Confirm")
-        # c. tap Confirm (regardless -- we're in the claim flow)
+        self._sleep_responsive(CLAIM_STEP_DELAY_S)          # settle before Confirm
+        # d. tap Confirm (regardless -- we're in the claim flow)
         self._tap_region_center(CONGRATS_CONFIRM_REGION)
-        self._sleep_responsive(1.0)
-        # d. close the popup (X)
+        self._sleep_responsive(CLAIM_STEP_DELAY_S)          # settle before X
+        # e. close the popup (X)
         self._tap_region_center(CLOSE_MENU_COORDS)
-        # e. back to MAIN_MENU
+        # f. back to MAIN_MENU
         self.sleep_human(1.0)
         return State.MAIN_MENU
 
@@ -916,29 +922,13 @@ class Orchestrator:
         self._relay_used = False           # new run: relay/revive not yet used
         self._boost_used = False           # new run: initial boost not yet used
         while self.running:
-            self._sleep_responsive(1.0)
-            if not self.running:
-                break
-
             shot = self._grab_watchdog_frame()          # PNG (cached-captcha path)
-            captcha = self._captcha_active_cached(shot)
-            game_over = (not captcha) and self._gameover_present(shot)
-            self.log(State.PLAYING,
-                     f"scan -> captcha={captcha} | game_over={game_over}")
 
-            if captcha:
-                self.log(State.PLAYING,
-                         "captcha detected (OCR) -> solving (game-over suppressed)")
-                self._solve_captcha_inline()
-                continue
-            if game_over:
-                self.log(State.PLAYING,
-                         "RESULT screen confirmed (OCR) -> GAME_OVER (-> OPEN_BOX)")
-                return State.GAME_OVER
+            # Long Run: BOOST + RELAY FIRST. Their "Tap to activate ... Boost!"
+            # banners are brief, so we check them before the heavier game-over /
+            # captcha OCR (which was delaying the tap enough to miss the window).
+            # Each is one-shot + strictly toggle-gated; skipped entirely when OFF.
             if self.playing_mode == "long_run":
-                # Boost + Relay each detected by their OWN "Tap to activate ...
-                # Boost!" banner (OCR), fired ONCE per run, STRICTLY gated by their
-                # toggle. Each check is skipped entirely when its toggle is OFF.
                 if (self.long_run_boost_enabled and not self._boost_used
                         and self._boost_prompt_present(shot)):
                     self.tap("boost_slot")
@@ -952,6 +942,22 @@ class Orchestrator:
                     self._relay_used = True
                     self.log(State.PLAYING,
                              "long-run reflex: Relay Boost activated (banner tap)")
+
+            captcha = self._captcha_active_cached(shot)
+            game_over = (not captcha) and self._gameover_present(shot)
+            self.log(State.PLAYING,
+                     f"scan -> captcha={captcha} | game_over={game_over}")
+
+            if captcha:
+                self.log(State.PLAYING,
+                         "captcha detected (OCR) -> solving (game-over suppressed)")
+                self._solve_captcha_inline()
+            elif game_over:
+                self.log(State.PLAYING,
+                         "RESULT screen confirmed (OCR) -> GAME_OVER (-> OPEN_BOX)")
+                return State.GAME_OVER
+
+            self._sleep_responsive(1.0)                 # check first, then pace
         return State.GAME_OVER
 
     @staticmethod
@@ -1394,7 +1400,7 @@ def _self_check() -> int:
     st = Orchestrator.handle_main_menu(o)
     check("'Get!' -> claim seq (claim,Confirm,close) -> MAIN_MENU (no Play)",
           st is State.MAIN_MENU and "play_button" not in taps and region_taps ==
-          [TICKET_GET_TAP_REGION, CONGRATS_CONFIRM_REGION, CLOSE_MENU_COORDS])
+          [TICKET_GET_TAP_REGION, REWARD_CLAIM_REGION, CONGRATS_CONFIRM_REGION, CLOSE_MENU_COORDS])
 
     # CASE A (degraded): "Get!" up but "Congratulations!" OCR misses -> Confirm +
     # close are STILL tapped (best-effort), so the popup can't get stuck open.
@@ -1408,7 +1414,7 @@ def _self_check() -> int:
     st = Orchestrator.handle_main_menu(o)
     check("'Get!' + congrats OCR miss -> still taps Confirm + close -> MAIN_MENU",
           st is State.MAIN_MENU and region_taps ==
-          [TICKET_GET_TAP_REGION, CONGRATS_CONFIRM_REGION, CLOSE_MENU_COORDS])
+          [TICKET_GET_TAP_REGION, REWARD_CLAIM_REGION, CONGRATS_CONFIRM_REGION, CLOSE_MENU_COORDS])
 
     # CASE B: no "Get!" -> NON-BLOCKING pass-through to Play/BEFORE_START.
     o = build()
@@ -1433,7 +1439,7 @@ def _self_check() -> int:
     st = Orchestrator.handle_main_menu(o)
     check("low anchor + 'Get!' -> STILL claims (anchor no longer gates)",
           st is State.MAIN_MENU and "play_button" not in taps and region_taps ==
-          [TICKET_GET_TAP_REGION, CONGRATS_CONFIRM_REGION, CLOSE_MENU_COORDS])
+          [TICKET_GET_TAP_REGION, REWARD_CLAIM_REGION, CONGRATS_CONFIRM_REGION, CLOSE_MENU_COORDS])
 
     # -- X. Mystery-box text gate (OPEN_BOX) -------------------------------- #
     print("\n-- X. mystery-box text gate (OCR 'Mystery Box') --")
