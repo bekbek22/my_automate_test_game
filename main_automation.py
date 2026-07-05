@@ -126,7 +126,7 @@ TICKET_MATCH_THRESHOLD = 0.75                   # cv2 matchTemplate confidence
 # "Get!" balloon is present on the main menu, run a strict tap sequence to claim
 # the reward, then return to MAIN_MENU. All four targets are (x, y, w, h) regions;
 # each tap lands on the region CENTER.
-TICKET_GET_REGION = (612, 84, 94, 36)          # red "Get!" balloon (OCR + tap)
+TICKET_GET_REGION = (577, 84, 148, 94)         # red "Get!" balloon + "x/x" count (OCR + tap)
 CONGRATS_REGION = (669, 688, 259, 71)          # "Congratulations!" popup (tap + OCR)
 REWARD_TAP_COORDS = (641, 671, 316, 88)        # collect-reward button region
 CLOSE_MENU_COORDS = (1320, 168, 49, 46)        # close-menu (X) button region
@@ -397,32 +397,36 @@ class Orchestrator:
             waited += STOP_POLL_INTERVAL_S
         return False
 
+    def _get_balloon_present(self, shot) -> bool:
+        """True when the red 'Get!' balloon is up in TICKET_GET_REGION (relics
+        full). OCR both polarities (white text on a red balloon) at psm 6 since
+        the region also spans the 'x/x' count line; match 'get' in either."""
+        for inv in (False, True):
+            txt = self._ocr_region_text(shot, TICKET_GET_REGION,
+                                        upscale=3, psm=6, invert=inv)
+            if txt and "get" in txt.lower():
+                return True
+        return False
+
     def handle_main_menu(self) -> State:
         self._throttle()
-        # OPTIONAL PRE-FLIGHT REWARD CLAIM (non-blocking). If the red "Get!"
-        # balloon is up, claim the reward first; otherwise fall straight through
-        # to the normal game loop (tap Play -> BEFORE_START). Never stands by.
-        #  * Anchor guard only gates the OPTIONAL claim OCR: we run the "Get!"
-        #    read when confirmed on MAIN_MENU (conf >= threshold) or when the
-        #    anchor can't run at all (conf < 0). A definitive low match
-        #    (0 <= conf < threshold) means we're not on MAIN_MENU -> skip the OCR
-        #    (avoid a false "Get!") but STILL proceed to Play.
+        # OPTIONAL PRE-FLIGHT REWARD CLAIM (non-blocking). When the relics fill up
+        # the game shows a red "Get!" balloon; claim it, then re-evaluate. No "Get!"
+        # -> fall straight through to the normal game loop (Play -> BEFORE_START).
+        # We do NOT gate on the template anchor: handle_main_menu only runs in the
+        # MAIN_MENU state and "Get!" is a distinctive word, so gating risked
+        # silently blocking the claim when the anchor template matched poorly. The
+        # anchor confidence is logged as a hint only.
         shot = self._grab_watchdog_frame()
         conf = self._match_main_menu_anchor(shot)
-        if conf >= TICKET_MATCH_THRESHOLD or conf < 0:
-            text = self._ocr_region_text(shot, TICKET_GET_REGION)
-            if text and "get" in text.lower():
-                self.log(State.MAIN_MENU, "'Get!' balloon detected -> claiming reward")
-                return self._claim_get_reward()      # CASE A: claim, then re-evaluate
-            self.log(State.MAIN_MENU, "no 'Get!' balloon -> proceeding to start match")
-        else:
+        if self._get_balloon_present(shot):
             self.log(State.MAIN_MENU,
-                     f"MAIN_MENU not confirmed (anchor={conf:.2f}) -> "
-                     "skipping claim, proceeding")
+                     f"'Get!' balloon detected (anchor={conf:.2f}) -> claiming reward")
+            return self._claim_get_reward()          # CASE A: claim, then re-evaluate
 
-        # CASE B / default: normal game loop.
-        self.log(State.MAIN_MENU, "clicking play button -> prep")
-        self.tap("play_button")
+        self.log(State.MAIN_MENU,
+                 f"no 'Get!' balloon (anchor={conf:.2f}) -> clicking play -> prep")
+        self.tap("play_button")                      # CASE B: normal game loop
         self.sleep_human(1.5)
         return State.BEFORE_START
 
@@ -1411,18 +1415,19 @@ def _self_check() -> int:
     check("no 'Get!' -> pass through to BEFORE_START + Play (no claim taps)",
           st is State.BEFORE_START and "play_button" in taps and region_taps == [])
 
-    # Anchor low (<0.75) -> skip the claim OCR (no false "Get!") but STILL proceed.
+    # Anchor is NO LONGER a gate: a low anchor still claims when "Get!" is present.
     o = build()
     o._match_main_menu_anchor = lambda shot: 0.30
-    def _no_ocr(shot, region, **k):
-        raise AssertionError("claim OCR must be skipped when anchor < threshold")
-    o._ocr_region_text = _no_ocr
+    o._ocr_region_text = lambda shot, region, **k: (
+        "Get!" if region == TICKET_GET_REGION else "")
+    o._await_text = lambda region, needle, timeout_s: True
     region_taps = []
     o._tap_region_center = lambda region: region_taps.append(region)
     taps.clear()
     st = Orchestrator.handle_main_menu(o)
-    check("anchor low (<0.75) -> skips claim OCR but still proceeds to BEFORE_START",
-          st is State.BEFORE_START and "play_button" in taps and region_taps == [])
+    check("low anchor + 'Get!' -> STILL claims (anchor no longer gates)",
+          st is State.MAIN_MENU and "play_button" not in taps and region_taps ==
+          [TICKET_GET_REGION, CONGRATS_REGION, REWARD_TAP_COORDS, CLOSE_MENU_COORDS])
 
     # -- X. Mystery-box text gate (OPEN_BOX) -------------------------------- #
     print("\n-- X. mystery-box text gate (OCR 'Mystery Box') --")
