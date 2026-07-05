@@ -128,9 +128,9 @@ TICKET_MATCH_THRESHOLD = 0.75                   # cv2 matchTemplate confidence
 # each tap lands on the region CENTER.
 TICKET_GET_REGION = (610, 87, 98, 31)          # red "Get!" balloon text (OCR detect)
 TICKET_GET_TAP_REGION = (588, 107, 134, 62)    # button to tap to open the reward (claim)
-CONGRATS_REGION = (669, 688, 259, 71)          # "Congratulations!" popup (tap + OCR)
-REWARD_TAP_COORDS = (641, 671, 316, 88)        # collect-reward button region
-CLOSE_MENU_COORDS = (1320, 168, 49, 46)        # close-menu (X) button region
+CONGRATS_REGION = (527, 121, 545, 70)          # "Congratulations!" text (OCR detect)
+CONGRATS_CONFIRM_REGION = (643, 674, 322, 82)  # "Confirm" button on the congrats popup
+CLOSE_MENU_COORDS = (1323, 173, 44, 38)        # close-menu (X) button
 CONGRATS_POLL_TIMEOUT_S = 5.0                  # max wait for "Congratulations!" text
 
 COORDS: Dict[str, tuple[int, int]] = {
@@ -450,29 +450,24 @@ class Orchestrator:
         return State.BEFORE_START
 
     def _claim_get_reward(self) -> State:
-        """Strict post-'Get!' claim sequence: tap the balloon, wait for the reward
-        popup, confirm 'Congratulations!' via OCR, collect the reward, close the
-        menu, and return to MAIN_MENU. Every tap lands on its region center."""
+        """Post-'Get!' claim: tap the claim button, wait for the 'Congratulations!'
+        popup (OCR), tap Confirm, close the popup (X), back to MAIN_MENU. Confirm +
+        close are tapped even if the OCR misses (best-effort) so a bad read can't
+        leave the popup stuck open."""
         # a. tap the claim button to open the reward
         self._tap_region_center(TICKET_GET_TAP_REGION)
-        # b. fixed settle for the reward popup to animate in
-        self._sleep_responsive(3.0)
-        # c. tap the congrats popup
-        self._tap_region_center(CONGRATS_REGION)
-        # d. poll until "Congratulations!" is confirmed (bounded)
-        if self._await_text(CONGRATS_REGION, "congratulations",
-                            CONGRATS_POLL_TIMEOUT_S):
-            self.log(State.MAIN_MENU,
-                     "'Congratulations!' confirmed -> collecting reward")
-            # e. collect the reward (only once the popup is confirmed)
-            self._tap_region_center(REWARD_TAP_COORDS)
-        else:
-            self.log(State.MAIN_MENU,
-                     "'Congratulations!' not confirmed within "
-                     f"{CONGRATS_POLL_TIMEOUT_S:.0f}s -> skipping reward tap")
-        # f. close the menu (always, so we return to a clean main menu)
+        # b. wait for the "Congratulations!" popup to render (bounded OCR poll)
+        seen = self._await_text(CONGRATS_REGION, "congratulations",
+                                CONGRATS_POLL_TIMEOUT_S)
+        self.log(State.MAIN_MENU,
+                 f"'Congratulations!' {'confirmed' if seen else 'not seen'} "
+                 "-> tapping Confirm")
+        # c. tap Confirm (regardless -- we're in the claim flow)
+        self._tap_region_center(CONGRATS_CONFIRM_REGION)
+        self._sleep_responsive(1.0)
+        # d. close the popup (X)
         self._tap_region_center(CLOSE_MENU_COORDS)
-        # g. back to MAIN_MENU
+        # e. back to MAIN_MENU
         self.sleep_human(1.0)
         return State.MAIN_MENU
 
@@ -1397,23 +1392,23 @@ def _self_check() -> int:
     o._tap_region_center = lambda region: region_taps.append(region)
     taps.clear()
     st = Orchestrator.handle_main_menu(o)
-    check("'Get!' -> claim seq (get,congrats,reward,close) -> MAIN_MENU (no Play)",
+    check("'Get!' -> claim seq (claim,Confirm,close) -> MAIN_MENU (no Play)",
           st is State.MAIN_MENU and "play_button" not in taps and region_taps ==
-          [TICKET_GET_TAP_REGION, CONGRATS_REGION, REWARD_TAP_COORDS, CLOSE_MENU_COORDS])
+          [TICKET_GET_TAP_REGION, CONGRATS_CONFIRM_REGION, CLOSE_MENU_COORDS])
 
-    # CASE A (degraded): "Get!" up but "Congratulations!" never confirmed ->
-    # skip the reward tap, still close, back to MAIN_MENU.
+    # CASE A (degraded): "Get!" up but "Congratulations!" OCR misses -> Confirm +
+    # close are STILL tapped (best-effort), so the popup can't get stuck open.
     o = build()
     o._match_main_menu_anchor = lambda shot: 0.9
     o._ocr_region_text = lambda shot, region, **k: (
         "Get!" if region == TICKET_GET_REGION else "")
-    o._await_text = lambda region, needle, timeout_s: False     # congrats timed out
+    o._await_text = lambda region, needle, timeout_s: False     # congrats OCR missed
     region_taps = []
     o._tap_region_center = lambda region: region_taps.append(region)
     st = Orchestrator.handle_main_menu(o)
-    check("'Get!' + congrats timeout -> skips reward tap, still closes -> MAIN_MENU",
+    check("'Get!' + congrats OCR miss -> still taps Confirm + close -> MAIN_MENU",
           st is State.MAIN_MENU and region_taps ==
-          [TICKET_GET_TAP_REGION, CONGRATS_REGION, CLOSE_MENU_COORDS])
+          [TICKET_GET_TAP_REGION, CONGRATS_CONFIRM_REGION, CLOSE_MENU_COORDS])
 
     # CASE B: no "Get!" -> NON-BLOCKING pass-through to Play/BEFORE_START.
     o = build()
@@ -1438,7 +1433,7 @@ def _self_check() -> int:
     st = Orchestrator.handle_main_menu(o)
     check("low anchor + 'Get!' -> STILL claims (anchor no longer gates)",
           st is State.MAIN_MENU and "play_button" not in taps and region_taps ==
-          [TICKET_GET_TAP_REGION, CONGRATS_REGION, REWARD_TAP_COORDS, CLOSE_MENU_COORDS])
+          [TICKET_GET_TAP_REGION, CONGRATS_CONFIRM_REGION, CLOSE_MENU_COORDS])
 
     # -- X. Mystery-box text gate (OPEN_BOX) -------------------------------- #
     print("\n-- X. mystery-box text gate (OCR 'Mystery Box') --")
