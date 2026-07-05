@@ -260,7 +260,7 @@ class Orchestrator:
     def _ticket_template(self):
         """Cached grayscale template for the MAIN_MENU ticket anchor, or None if
         cv2/the asset is unavailable (-> anchor degrades to 'n/a')."""
-        if getattr(self, "_ticket_tmpl_cache", "unset") == "unset":
+        if not hasattr(self, "_ticket_tmpl_cache"):
             self._ticket_tmpl_cache = None
             try:
                 import cv2
