@@ -63,8 +63,8 @@ def main() -> None:
         while time.time() - t0 < DURATION_S:
             shot = o._grab_watchdog_frame()
             conf = o._match_main_menu_anchor(shot)
-            get_n = o._ocr_region_text(shot, TICKET_GET_REGION, upscale=3, psm=6)
-            get_i = o._ocr_region_text(shot, TICKET_GET_REGION, upscale=3, psm=6,
+            get_n = o._ocr_region_text(shot, TICKET_GET_REGION, upscale=3, psm=7)
+            get_i = o._ocr_region_text(shot, TICKET_GET_REGION, upscale=3, psm=7,
                                        invert=True)
             hit = any("get" in (t or "").lower() for t in (get_n, get_i))
             gated = 0.0 <= conf < TICKET_MATCH_THRESHOLD

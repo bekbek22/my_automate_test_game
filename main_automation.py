@@ -126,7 +126,7 @@ TICKET_MATCH_THRESHOLD = 0.75                   # cv2 matchTemplate confidence
 # "Get!" balloon is present on the main menu, run a strict tap sequence to claim
 # the reward, then return to MAIN_MENU. All four targets are (x, y, w, h) regions;
 # each tap lands on the region CENTER.
-TICKET_GET_REGION = (577, 84, 148, 94)         # red "Get!" balloon + "x/x" count (OCR + tap)
+TICKET_GET_REGION = (610, 87, 98, 31)          # red "Get!" balloon text (OCR)
 CONGRATS_REGION = (669, 688, 259, 71)          # "Congratulations!" popup (tap + OCR)
 REWARD_TAP_COORDS = (641, 671, 316, 88)        # collect-reward button region
 CLOSE_MENU_COORDS = (1320, 168, 49, 46)        # close-menu (X) button region
@@ -409,11 +409,11 @@ class Orchestrator:
 
     def _get_balloon_present(self, shot) -> bool:
         """True when the red 'Get!' balloon is up in TICKET_GET_REGION (relics
-        full). OCR both polarities (white text on a red balloon) at psm 6 since
-        the region also spans the 'x/x' count line; match 'get' in either."""
+        full). Single-line region -> psm 7; OCR both polarities (white text on a
+        red balloon) and match 'get' in either."""
         for inv in (False, True):
             txt = self._ocr_region_text(shot, TICKET_GET_REGION,
-                                        upscale=3, psm=6, invert=inv)
+                                        upscale=3, psm=7, invert=inv)
             if txt and "get" in txt.lower():
                 return True
         return False
