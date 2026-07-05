@@ -704,10 +704,16 @@ class Orchestrator:
 
                 # ---- PHASE 2: captcha + game-over, ARMED only after relay (or when
                 # relay is disabled -> nothing to wait for) ----
+                # STRICT PRIORITY (do NOT reorder): captcha is evaluated FIRST every
+                # frame. When it is active we take CAPTCHA and the `elif` guarantees
+                # _gameover_present is never even called that frame -- game-over is
+                # bypassed entirely. This stops a captcha-covered end screen from
+                # being misread as a generic GAME_OVER and killing the run before the
+                # anti-bot block is solved. Game-over runs ONLY when captcha is False.
                 if self._relay_used or not self.long_run_relay_enabled:
-                    if self._captcha_active_cached(shot):        # captcha has priority
-                        detected = State.CAPTCHA
-                    elif self._gameover_present(shot):           # OCR 'Result'
+                    if self._captcha_active_cached(shot):        # 1) captcha first
+                        detected = State.CAPTCHA                 #    -> skip game-over
+                    elif self._gameover_present(shot):           # 2) only if NO captcha
                         detected = State.GAME_OVER
             except Exception as exc:
                 self.log(State.PLAYING, f"watchdog sample error: {exc}")
@@ -921,13 +927,24 @@ class Orchestrator:
         self.log(State.PLAYING, "monitoring match: scanning captcha + game-over")
         self._relay_used = False           # new run: relay/revive not yet used
         self._boost_used = False           # new run: initial boost not yet used
+
+        # STRICT PER-FRAME CASCADE (do NOT reorder) -- every loop iteration runs
+        # these four checks in this exact priority order:
+        #   1) BOOST   -- tap "Fast Start Boost!" at t=0 (one-shot, toggle-gated)
+        #   2) RELAY   -- tap "Cookie Relay Boost!" / revive (one-shot, toggle-gated)
+        #   3) CAPTCHA -- anti-bot popup; solved inline, and SUPPRESSES game-over
+        #   4) GAME_OVER -- 'Result' OCR; only when captcha is False
+        # This ordering is deliberate: boost/relay banners are brief, so they are
+        # handled before the heavier captcha/game-over OCR that would otherwise miss
+        # their window; and captcha outranks game-over so a captcha-covered end
+        # screen is never misread as GAME_OVER. There is intentionally NO phase gate
+        # holding captcha/game-over off during boost -- the boost banner is neither a
+        # captcha nor a 'Result' screen, so 3) and 4) naturally read False until
+        # active gameplay, which avoids any "blind if boost is missed/disabled" risk.
         while self.running:
             shot = self._grab_watchdog_frame()          # PNG (cached-captcha path)
 
-            # Long Run: BOOST + RELAY FIRST. Their "Tap to activate ... Boost!"
-            # banners are brief, so we check them before the heavier game-over /
-            # captcha OCR (which was delaying the tap enough to miss the window).
-            # Each is one-shot + strictly toggle-gated; skipped entirely when OFF.
+            # ---- 1) BOOST + 2) RELAY (long_run only): one-shot, toggle-gated ----
             if self.playing_mode == "long_run":
                 if (self.long_run_boost_enabled and not self._boost_used
                         and self._boost_prompt_present(shot)):
@@ -943,6 +960,7 @@ class Orchestrator:
                     self.log(State.PLAYING,
                              "long-run reflex: Relay Boost activated (banner tap)")
 
+            # ---- 3) CAPTCHA (priority) + 4) GAME_OVER (only when captcha False) ----
             captcha = self._captcha_active_cached(shot)
             game_over = (not captcha) and self._gameover_present(shot)
             self.log(State.PLAYING,
@@ -1467,7 +1485,7 @@ def _self_check() -> int:
         def wait(s, timeout=None): return 0
         def kill(s): pass
 
-    def run_wd(relay_enabled, banner, captcha=False):
+    def run_wd(relay_enabled, banner, captcha=False, gameover=False):
         o = build("macro")
         o.long_run_relay_enabled = relay_enabled
         o._relay_used = False
@@ -1475,6 +1493,7 @@ def _self_check() -> int:
         o._captcha_active_cached = lambda shot: captcha
         o._captcha_confirm = lambda: False
         o._region_color_ratio = lambda *a, **k: 0.0        # RESULT never fires
+        o._gameover_present = lambda shot: gameover        # OCR 'Result'
         o._relay_prompt_present = lambda shot: banner
         o._purge_adb_input_buffer = lambda: None
         o._solve_captcha_inline = lambda: None
@@ -1498,6 +1517,11 @@ def _self_check() -> int:
           run_wd(False, False, captcha=True) == ([], State.CAPTCHA))
     check("PHASE 2: relay fires, then captcha armed -> relay + captcha detected",
           run_wd(True, True, captcha=True) == (["relay"], State.CAPTCHA))
+    # STRICT PRIORITY: captcha + game-over present on the SAME frame -> CAPTCHA wins
+    # and game-over is bypassed (a captcha-covered end screen must never terminate
+    # the run before the anti-bot block is solved).
+    check("captcha + game-over same frame -> CAPTCHA wins (game-over bypassed)",
+          run_wd(False, False, captcha=True, gameover=True) == ([], State.CAPTCHA))
 
     ok = all(results)
     print("\n" + "=" * 64)

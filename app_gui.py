@@ -285,6 +285,7 @@ class AutomationGUI(tk.Tk):
                                              font=("Consolas", 9),
                                              relief="flat", borderwidth=0)
         self.log.pack(fill="both", expand=True)
+        self._attach_log_copy_bindings(self.log)
 
 
     def _on_play_mode_change(self) -> None:
@@ -526,6 +527,41 @@ class AutomationGUI(tk.Tk):
         self.log.insert("end", text)
         self.log.see("end")
         self.log.config(state="disabled")
+
+    def _attach_log_copy_bindings(self, widget) -> None:
+        """Make the read-only log drag-selectable AND copyable. A disabled Text is
+        already selectable by mouse, but it never accepts keyboard focus, so the
+        default Ctrl+C is swallowed. We grab focus on click and bind copy /
+        select-all (Ctrl and Cmd) plus a right-click Copy menu explicitly, leaving
+        the widget disabled so it stays read-only."""
+        widget.configure(takefocus=True)
+        widget.bind("<Button-1>", lambda e: widget.focus_set(), add="+")
+        for seq in ("<Control-c>", "<Control-C>", "<Command-c>", "<Command-C>"):
+            widget.bind(seq, self._copy_log_selection)
+        for seq in ("<Control-a>", "<Control-A>", "<Command-a>", "<Command-A>"):
+            widget.bind(seq, self._select_all_log)
+        menu = tk.Menu(widget, tearoff=0)
+        menu.add_command(label="Copy", command=self._copy_log_selection)
+        menu.add_command(label="Select All", command=self._select_all_log)
+
+        def _popup(event):
+            widget.focus_set()
+            menu.tk_popup(event.x_root, event.y_root)
+
+        widget.bind("<Button-3>", _popup)          # right-click context menu
+
+    def _copy_log_selection(self, event=None) -> str:
+        try:
+            text = self.log.get("sel.first", "sel.last")
+        except tk.TclError:
+            return "break"                          # nothing selected
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        return "break"
+
+    def _select_all_log(self, event=None) -> str:
+        self.log.tag_add("sel", "1.0", "end-1c")
+        return "break"
 
     def _on_clear_log(self) -> None:
         self.log.config(state="normal")
