@@ -66,6 +66,7 @@ RESULT_COLOR_REGION = (669, 55, 262, 70)
 RESULT_TARGET_RGB = (255, 205, 0)
 RESULT_COLOR_TOLERANCE = 15
 RESULT_REQUIRED_RATIO = 0.15
+RESULT_CONFIRM_TIMEOUT_S = 15.0        # bound the GAME_OVER RESULT wait (was unbounded)
 
 CAPTCHA_CONFIRM_ATTEMPTS = 5
 CAPTCHA_CONFIRM_GAP_S = 0.02
@@ -321,12 +322,19 @@ class Orchestrator:
         return any(kw in low for kw in BOOST_PROMPT_KEYWORDS)
 
     def _gameover_present(self, shot) -> bool:
-        """True when the game-over / RESULT screen is up -- OCR 'result' in the
-        result banner region. Reliable replacement for the old yellow-color check
-        (which false-fired on the captcha's yellow, needing a confirm hack). The
-        captcha screen never reads 'result', so no exclusion is needed."""
+        """True only when BOTH the 'Result' OCR text AND the RESULT banner's yellow
+        are present. The result region overlaps the captcha's 'Find the ...' banner,
+        so OCR alone false-fired on a captcha (misreading it as 'result') and trapped
+        the bot in a bogus GAME_OVER; the yellow alone false-fired on the captcha's
+        own yellow. A real result screen shows both (~37% yellow), a captcha shows
+        the text-misread but ~0% yellow -- so requiring both cleanly separates them
+        and lets the captcha 'find the' check win."""
         txt = self._ocr_region_text(shot, RESULT_COLOR_REGION, upscale=3)
-        return bool(txt) and "result" in txt.lower()
+        if not (txt and "result" in txt.lower()):
+            return False
+        ratio = self._region_color_ratio(RESULT_COLOR_REGION, RESULT_TARGET_RGB,
+                                          RESULT_COLOR_TOLERANCE, shot=shot)
+        return ratio >= RESULT_REQUIRED_RATIO
 
     def _activate_relay(self) -> None:
         """Activate the Relay Boost by tapping the slot ('Tap to activate ...').
@@ -799,10 +807,32 @@ class Orchestrator:
 
     def handle_game_over(self) -> State:
         self._throttle()
-        self.log(State.GAME_OVER, "awaiting RESULT banner (color density)")
-        self._await_color_density(RESULT_COLOR_REGION, RESULT_TARGET_RGB,
-                                  State.GAME_OVER, "RESULT")
-        self.log(State.GAME_OVER, "clicking OK -> reward chest")
+        self.log(State.GAME_OVER, "confirming RESULT banner (captcha-aware, bounded)")
+        # BOUNDED wait: a false GAME_OVER (e.g. the watchdog's 'Result' OCR
+        # misreading a CAPTCHA screen) used to trap us in an unbounded RESULT-color
+        # loop forever. Re-check captcha each pass -- captcha has priority, so if one
+        # is actually up we route back to CAPTCHA to solve it instead of hanging.
+        deadline = time.monotonic() + RESULT_CONFIRM_TIMEOUT_S
+        while self.running and time.monotonic() < deadline:
+            shot = self._grab_watchdog_frame()
+            if self._captcha_active_cached(shot):
+                self.log(State.GAME_OVER,
+                         "captcha detected while awaiting RESULT -> CAPTCHA (solve)")
+                return State.CAPTCHA
+            ratio = self._region_color_ratio(RESULT_COLOR_REGION, RESULT_TARGET_RGB,
+                                             RESULT_COLOR_TOLERANCE, shot=shot)
+            self.log(State.GAME_OVER,
+                     f"Waiting for RESULT color... current density: {ratio * 100:.1f}%")
+            if ratio >= RESULT_REQUIRED_RATIO:
+                self.log(State.GAME_OVER, f"RESULT confirmed (density {ratio * 100:.1f}%)")
+                self.tap("game_over_ok")
+                self.sleep_human(1.5)
+                return State.OPEN_BOX
+            self._sleep_responsive(1.0)
+        # Neither RESULT nor captcha within the timeout: don't brick. Best-effort tap
+        # OK and flow toward OPEN_BOX -> ... -> MAIN_MENU, which re-syncs the machine.
+        self.log(State.GAME_OVER,
+                 "RESULT not confirmed within timeout -> best-effort OK, continue")
         self.tap("game_over_ok")
         self.sleep_human(1.5)
         return State.OPEN_BOX
