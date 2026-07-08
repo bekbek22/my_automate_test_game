@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import random
+import threading
 import time
 from datetime import datetime
 
@@ -256,10 +257,18 @@ def playback_session(in_path: str = OUTPUT_FILE, adb=None,
             print(f"  [{t_ms:>6}ms] unknown action {action!r} -- skipped", flush=True)
             continue
 
+        # Drift telemetry: how far the ACTUAL fire time is from the recorded
+        # schedule. Targets are absolute (start + t_ms), so a healthy run shows a
+        # small, ~constant offset (one ADB round-trip) -- NOT a growing number. A
+        # steadily rising drift would signal real desync; a spike after a slide
+        # points at a blocking `input swipe` hold stalling the timeline.
+        drift_ms = (time.monotonic() - start) * 1000.0 - t_ms
+        d = f"drift {drift_ms:+.0f}ms"
+
         if action == "boost_relay":
             for i, (x, y) in enumerate(targets):
                 adb.shell("input", "tap", str(x), str(y))
-                print(f"  [{t_ms:>6}ms] {action:<12} -> tap ({x},{y})", flush=True)
+                print(f"  [{t_ms:>6}ms] {action:<12} -> tap ({x},{y}) [{d}]", flush=True)
                 if i < len(targets) - 1:
                     time.sleep(DUAL_TAP_GAP_S)
         else:
@@ -272,12 +281,24 @@ def playback_session(in_path: str = OUTPUT_FILE, adb=None,
                 x, y = targets[0]
 
             if action == "slide":
-                adb.shell("input", "swipe", str(x), str(y), str(x), str(y), str(duration))
-                print(f"  [{t_ms:>6}ms] {action:<12} -> hold {duration}ms @ ({x},{y})",
-                      flush=True)
+                # Async hold: `input swipe` BLOCKS for its full duration, which
+                # stalls the timeline and bunches later inputs. Fire it in a
+                # short-lived daemon thread so the absolute scheduler keeps ticking
+                # -- subsequent taps/jumps then land on their own deadlines and
+                # legitimately overlap the hold (matching real multi-touch play).
+                # No lock around adb.shell: each call opens its own adb connection/
+                # process, so concurrent taps are safe, and a lock would just
+                # re-serialize (re-block) the swipe we're trying to background.
+                threading.Thread(
+                    target=adb.shell,
+                    args=("input", "swipe", str(x), str(y), str(x), str(y), str(duration)),
+                    daemon=True,
+                ).start()
+                print(f"  [{t_ms:>6}ms] {action:<12} -> hold {duration}ms @ ({x},{y}) "
+                      f"[async {d}]", flush=True)
             else:
                 adb.shell("input", "tap", str(x), str(y))
-                print(f"  [{t_ms:>6}ms] {action:<12} -> tap @ ({x},{y})", flush=True)
+                print(f"  [{t_ms:>6}ms] {action:<12} -> tap @ ({x},{y}) [{d}]", flush=True)
 
     print("Playback complete.")
 
