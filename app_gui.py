@@ -227,6 +227,11 @@ class AutomationGUI(tk.Tk):
                         variable=self.relay_var).pack(anchor="w")
         ttk.Checkbutton(chk_box, text="Roll Random Buff",
                         variable=self.roll_var).pack(anchor="w")
+        self.reward_claim_var = tk.BooleanVar(
+            value=s.get("reward_claim_enabled", M.reward_claim_enabled))
+        ttk.Checkbutton(chk_box, text="Auto-Click 'Get!' Reward",
+                        variable=self.reward_claim_var,
+                        command=self._on_reward_claim_toggle).pack(anchor="w")
 
         # --- Macro Configuration ---
         macro_box = ttk.LabelFrame(sidebar, text="Macro Configuration")
@@ -306,6 +311,14 @@ class AutomationGUI(tk.Tk):
         self._save_config()
         self._append(f"[LONG RUN] Boost Start={boost}  Relay={relay}\n")
 
+    def _on_reward_claim_toggle(self) -> None:
+        enabled = self.reward_claim_var.get()
+        M.reward_claim_enabled = enabled
+        if self.orch:                                # live-apply to a running loop
+            self.orch.reward_claim_enabled = enabled
+        self._save_config()
+        self._append(f"[REWARD] Auto-Click 'Get!' = {enabled}\n")
+
     def _scan_macros(self) -> list:
         """Sorted list of macro base-names (no .json) in the macro/ folder."""
         try:
@@ -343,6 +356,7 @@ class AutomationGUI(tk.Tk):
             "playing_mode": self.play_mode_var.get(),
             "long_run_boost_enabled": self.lr_boost_var.get(),
             "long_run_relay_enabled": self.lr_relay_var.get(),
+            "reward_claim_enabled": self.reward_claim_var.get(),
         }
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
@@ -440,6 +454,7 @@ class AutomationGUI(tk.Tk):
         M.PLAYING_MODE = self.play_mode_var.get()
         M.long_run_boost_enabled = self.lr_boost_var.get()
         M.long_run_relay_enabled = self.lr_relay_var.get()
+        M.reward_claim_enabled = self.reward_claim_var.get()
 
         self._save_config()
         self.orch = Orchestrator(M.MODE)

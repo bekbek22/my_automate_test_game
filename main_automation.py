@@ -32,6 +32,10 @@ roll_random_buff = True
 
 long_run_boost_enabled = True
 long_run_relay_enabled = True
+# When True, detecting the red "Get!" reward balloon on the main menu triggers the
+# auto-claim tap sequence. When False, the balloon is still detected and logged,
+# but the claim is skipped (no click) and the loop proceeds straight to Play.
+reward_claim_enabled = True
 
 
 
@@ -54,6 +58,15 @@ STOP_VANISH_MAE_THRESH = 8.0
 STOP_POLL_INTERVAL_S = 0.4
 STOP_FAST_POLL_S = 0.05
 STOP_TIMEOUT_S = 20.0
+# Dedicated, tighter budget for the STOP-button *appear* scan. The old 20s cap
+# meant an already-settled roll (button appeared+vanished before the scan even
+# started) burned a full 20s of "stuck" before proceeding. 6s is enough to catch
+# a live roll while failing fast when the transition has already happened.
+STOP_APPEAR_TIMEOUT_S = 6.0
+# Safety ceiling for the color-density wait (previously an unbounded
+# `while self.running:` loop -- a genuine infinite-loop risk if the target color
+# never rendered). Generous, so a legitimately slow transition still resolves.
+COLOR_DENSITY_TIMEOUT_S = 25.0
 
 RESULT_REGION = (523, 43, 556, 99)
 MYSTERY_BOX_REGION = (592, 50, 431, 103)
@@ -179,6 +192,7 @@ class Orchestrator:
         self.playing_mode = PLAYING_MODE
         self.long_run_boost_enabled = long_run_boost_enabled
         self.long_run_relay_enabled = long_run_relay_enabled
+        self.reward_claim_enabled = reward_claim_enabled
         self.adb_cfg = AdbConfig()
         self.adb = Adb(self.adb_cfg)
         self.running = True
@@ -419,7 +433,12 @@ class Orchestrator:
         needle = needle.lower()
         waited = 0.0
         while self.running and waited < timeout_s:
-            txt = self._ocr_region_text(self._grab_watchdog_frame(), region)
+            try:
+                txt = self._ocr_region_text(self._grab_watchdog_frame(), region)
+            except Exception:
+                # Capture/OCR is now time-capped; a residual failure must not
+                # crash the confirm-popup wait -- skip this frame and retry.
+                txt = ""
             if txt and needle in txt.lower():
                 return True
             self._sleep_responsive(STOP_POLL_INTERVAL_S)
@@ -448,13 +467,21 @@ class Orchestrator:
         # anchor confidence is logged as a hint only.
         shot = self._grab_watchdog_frame()
         conf = self._match_main_menu_anchor(shot)
-        if self._get_balloon_present(shot):
+        balloon = self._get_balloon_present(shot)    # detect regardless of toggle
+        if balloon and self.reward_claim_enabled:
             self.log(State.MAIN_MENU,
                      f"'Get!' balloon detected (anchor={conf:.2f}) -> claiming reward")
             return self._claim_get_reward()          # CASE A: claim, then re-evaluate
 
-        self.log(State.MAIN_MENU,
-                 f"no 'Get!' balloon (anchor={conf:.2f}) -> clicking play -> prep")
+        if balloon:
+            # Toggle OFF: acknowledge the balloon but skip the claim tap sequence
+            # entirely, then fall through to the normal Play path.
+            self.log(State.MAIN_MENU,
+                     f"'Get!' balloon detected (anchor={conf:.2f}) but auto-claim is "
+                     "OFF -> skipping claim, continuing to Play")
+        else:
+            self.log(State.MAIN_MENU,
+                     f"no 'Get!' balloon (anchor={conf:.2f}) -> clicking play -> prep")
         self.tap("play_button")                      # CASE B: normal game loop
         self.sleep_human(1.5)
         return State.BEFORE_START
@@ -881,12 +908,27 @@ class Orchestrator:
         return State.MAIN_MENU
 
 
-    def _await_stop_button_appear(self, timeout_s: float = STOP_TIMEOUT_S) -> None:
+    def _safe_screenshot(self, state: State, label: str) -> "Optional[Screenshot]":
+        """Capture a frame for a scan loop. The capture path is time-capped in
+        adb, so this can never block forever; on a stalled/failed capture it logs
+        and returns None instead of raising -- callers reset their diff baseline
+        and continue, and their own deadline/timeout ends the loop cleanly."""
+        try:
+            return self.adb.screenshot()
+        except Exception as exc:
+            self.log(state, f"{label}: capture error ({exc}) -- skipping frame")
+            return None
+
+    def _await_stop_button_appear(self, timeout_s: float = STOP_APPEAR_TIMEOUT_S) -> None:
         x, y, w, h = STOP_BUTTON_REGION
         prev: Optional[Screenshot] = None
         deadline = time.monotonic() + timeout_s
         while self.running and time.monotonic() < deadline:
-            shot = self.adb.screenshot()
+            shot = self._safe_screenshot(State.BEFORE_START, "STOP appear")
+            if shot is None:
+                prev = None
+                self._sleep_responsive(STOP_FAST_POLL_S)
+                continue
             if prev is not None:
                 mae = self._region_mae(prev, shot, x, y, w, h)
                 if mae >= STOP_VANISH_MAE_THRESH:
@@ -895,14 +937,20 @@ class Orchestrator:
                     return
             prev = shot
             self._sleep_responsive(STOP_FAST_POLL_S)
-        self.log(State.BEFORE_START, "STOP appear wait ended -- proceeding")
+        self.log(State.BEFORE_START,
+                 f"WARNING: STOP button not detected within {timeout_s:.0f}s "
+                 f"-- proceeding (roll likely already settled)")
 
     def _await_stop_button_vanish(self, timeout_s: float = STOP_TIMEOUT_S) -> None:
         x, y, w, h = STOP_BUTTON_REGION
         prev: Optional[Screenshot] = None
         deadline = time.monotonic() + timeout_s
         while self.running and time.monotonic() < deadline:
-            shot = self.adb.screenshot()
+            shot = self._safe_screenshot(State.BEFORE_START, "STOP vanish")
+            if shot is None:
+                prev = None
+                self._sleep_responsive(STOP_FAST_POLL_S)
+                continue
             if prev is not None:
                 mae = self._region_mae(prev, shot, x, y, w, h)
                 if mae < STOP_VANISH_MAE_THRESH:
@@ -911,15 +959,21 @@ class Orchestrator:
                     return
             prev = shot
             self._sleep_responsive(STOP_FAST_POLL_S)
-        self.log(State.BEFORE_START, "STOP vanish wait ended -- proceeding")
+        self.log(State.BEFORE_START,
+                 f"WARNING: STOP button still present after {timeout_s:.0f}s "
+                 f"-- proceeding")
 
     def _await_region_settled(self, region: tuple, state: State,
                               label: str) -> None:
         x, y, w, h = region
         prev: Optional[Screenshot] = None
-        waited = 0.0
-        while self.running and waited < STOP_TIMEOUT_S:
-            shot = self.adb.screenshot()
+        deadline = time.monotonic() + STOP_TIMEOUT_S
+        while self.running and time.monotonic() < deadline:
+            shot = self._safe_screenshot(state, f"{label} settle")
+            if shot is None:
+                prev = None
+                self._sleep_responsive(STOP_POLL_INTERVAL_S)
+                continue
             if prev is not None:
                 mae = self._region_mae(prev, shot, x, y, w, h)
                 self.log(state, f"{label} region MAE={mae:.2f}")
@@ -928,15 +982,19 @@ class Orchestrator:
                     return
             prev = shot
             self._sleep_responsive(STOP_POLL_INTERVAL_S)
-            waited += STOP_POLL_INTERVAL_S
-        self.log(state, f"{label} wait ended -- proceeding")
+        self.log(state, f"WARNING: {label} not settled within {STOP_TIMEOUT_S:.0f}s "
+                        f"-- proceeding")
 
     def _await_gameplay_active(self, timeout_s: float = 8.0) -> None:
         x, y, w, h = GAMEPLAY_MOTION_REGION
         prev: Optional[Screenshot] = None
-        waited = 0.0
-        while self.running and waited < timeout_s:
-            shot = self.adb.screenshot()
+        deadline = time.monotonic() + timeout_s
+        while self.running and time.monotonic() < deadline:
+            shot = self._safe_screenshot(State.PLAYING, "gameplay-active")
+            if shot is None:
+                prev = None
+                self._sleep_responsive(STOP_POLL_INTERVAL_S)
+                continue
             if prev is not None:
                 mae = self._region_mae(prev, shot, x, y, w, h)
                 self.log(State.PLAYING, f"gameplay-active MAE={mae:.2f}")
@@ -945,7 +1003,6 @@ class Orchestrator:
                     return
             prev = shot
             self._sleep_responsive(STOP_POLL_INTERVAL_S)
-            waited += STOP_POLL_INTERVAL_S
         self.log(State.PLAYING,
                  "gameplay-active wait ended (timeout) -- starting macro anyway")
 
@@ -1045,15 +1102,23 @@ class Orchestrator:
     def _await_color_density(self, region: tuple, target_rgb: tuple,
                              state: State, label: str,
                              tolerance: int = RESULT_COLOR_TOLERANCE,
-                             required_ratio: float = RESULT_REQUIRED_RATIO) -> None:
-        while self.running:
-            ratio = self._region_color_ratio(region, target_rgb, tolerance)
+                             required_ratio: float = RESULT_REQUIRED_RATIO,
+                             timeout_s: float = COLOR_DENSITY_TIMEOUT_S) -> None:
+        deadline = time.monotonic() + timeout_s
+        while self.running and time.monotonic() < deadline:
+            shot = self._safe_screenshot(state, f"{label} color")
+            if shot is None:
+                self._sleep_responsive(1.0)
+                continue
+            ratio = self._region_color_ratio(region, target_rgb, tolerance, shot=shot)
             self.log(state, f"Waiting for {label} color... "
                             f"current density: {ratio * 100:.1f}%")
             if ratio >= required_ratio:
                 self.log(state, f"{label} confirmed (density {ratio * 100:.1f}%)")
                 return
             self._sleep_responsive(1.0)
+        self.log(state, f"WARNING: {label} color not reached within {timeout_s:.0f}s "
+                        f"-- proceeding")
 
     def _ftc_config(self):
         if getattr(self, "_ftc_cfg_cache", None) is None:

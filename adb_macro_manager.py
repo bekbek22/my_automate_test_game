@@ -120,6 +120,12 @@ def color_close(c1: tuple[int, int, int], c2: tuple[int, int, int],
 
 USE_PERSISTENT_ADB = True
 
+# Hard cap on any single framebuffer capture. Screencap normally returns in
+# well under a second; this is purely a safety ceiling so a stalled emulator /
+# adb transport can never block a capture (and therefore a vision-scan loop)
+# indefinitely. Applies to both the ppadb socket path and the exec-out fallback.
+ADB_CAPTURE_TIMEOUT_S = 6.0
+
 
 class Adb:
 
@@ -210,22 +216,30 @@ class Adb:
         return int(m.group(1)), int(m.group(2))
 
     def exec_out(self, *args: str) -> bytes:
-        return subprocess.run(
-            self._base() + ["exec-out", *args],
-            capture_output=True, check=False,
-        ).stdout
+        try:
+            return subprocess.run(
+                self._base() + ["exec-out", *args],
+                capture_output=True, check=False,
+                timeout=ADB_CAPTURE_TIMEOUT_S,
+            ).stdout
+        except subprocess.TimeoutExpired:
+            # Stalled transport: return empty so callers surface a clean error /
+            # skip this frame instead of blocking their scan loop forever.
+            return b""
 
     def screenshot(self) -> Screenshot:
         dev = self._device()
         if dev is not None:
             try:
-                conn = dev.create_connection()
+                conn = dev.create_connection(timeout=ADB_CAPTURE_TIMEOUT_S)
                 with conn:
                     conn.send("exec:/system/bin/screencap")
                     raw = conn.read_all()
                 if raw:
                     return Screenshot.from_raw(raw)
             except Exception:
+                # Includes socket timeout: drop the persistent device and fall
+                # back to the (also time-capped) exec-out path below.
                 self._drop_device()
         raw = self.exec_out("screencap")
         if not raw:
@@ -240,7 +254,7 @@ class Adb:
         dev = self._device()
         if dev is not None:
             try:
-                conn = dev.create_connection()
+                conn = dev.create_connection(timeout=ADB_CAPTURE_TIMEOUT_S)
                 with conn:
                     conn.send("exec:/system/bin/screencap -p")
                     raw = conn.read_all()
